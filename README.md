@@ -30,8 +30,8 @@ Harness 的 initiator 链归属到对应会话。
 - 请求体、响应体默认显示**原始报文**，JSON 可切换美化显示；支持复制、复制为 cURL；
 - 请求/响应超过截断阈值、或响应体为二进制（base64）时会显示标记；
 - 顶部显示本会话的请求数与**总体占用空间**（鼠标悬停可看磁盘文件大小与保存目录）；
-- 顶部用**加粗警示文字**显示单会话磁盘上限：达到 `maxLogFileBytes` 后只会自动清理当前会话的旧日志；
-- 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录；
+- 顶部用**加粗警示文字**显示单会话磁盘上限：达到 `maxLogFileBytes` 后只会重写当前会话文件并保留最近记录；
+- 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录；WSL 下会自动转换为 Windows 路径并调用 `explorer.exe`；
 - **筛选** 支持按方法、URL、状态码、模型或类型过滤；
 - **导出 HAR** 会下载 HAR 1.2 文件；**清空** 会删除本会话的内存记录与磁盘文件。
 - 界面语言跟随 GUI 的全局语言（设置 → 通用 → 语言），同时面板头部有一个 **中 / EN** 快捷切换，只影响本面板，并会记住选择。
@@ -224,9 +224,9 @@ rm -rf <本包目录>                                         # 如不再需要�
 - 面板里的“占用空间”是本会话记录在内存中的估算大小；悬停提示里的“磁盘”是上述 JSONL 的
   实际大小；点击 **打开目录** 可直接定位。
 - 也可以设置 `persist: false` 只保留内存记录；此时悬停提示会显示“未持久化”。
-- 单个会话文件达到 `maxLogFileBytes`（默认 64 MiB）后，**只把这个会话的旧 JSONL 清掉并从当前
-  记录重新写**，不会因为一个会话超限而删除其它会话的文件。当前内存记录、面板列表与 HTTP 路由
-  仍正常；此时“占用空间”（内存估算）与“磁盘”可能不一致，刷新页面后只能加载磁盘上保留的新记录。
+- 单个会话文件达到 `maxLogFileBytes`（默认 **8 MiB**，仅为旧默认值的 1/8）后，只会重写这个
+  会话文件并保留最近约 1/4 上限的记录，不会删除其它会话的文件。当前内存记录、面板列表与 HTTP
+  路由仍正常；刷新页面后能加载磁盘上保留的最近记录。
 - **孤儿清理**：插件启动后约 1 秒扫描一次，之后默认每 60 秒扫描一次 `dataDir`，只处理文件名符合
   会话 id 规则的 `*.jsonl`。会话在被扫描时如果既不在 live Session / `sessionPersistence` 中，
   或已经进入 Workspace 归档集合，对应 JSONL 会被删除；父会话被归档/删除时，沿
@@ -251,11 +251,11 @@ rm -rf <本包目录>                                         # 如不再需要�
 | `redactSensitiveHeaders` | `true` | 把凭据类请求头的值替换为 `[redacted]`（如 `authorization`、`cookie`、`x-api-key`）。 |
 | `persist` | `true` | 是否把完成的记录追加写入 `dataDir` 下的 JSONL。 |
 | `dataDir` | `$DSH_HOME/session-http-log` | 记录保存目录（无 `DSH_HOME` 时回退到 `~/.dsh/session-http-log`）。 |
-| `maxLogFileBytes` | `67108864`（64 MiB） | **单会话**磁盘上限；达到上限时自动清理该会话旧 JSONL 并继续写新记录，不影响其它会话。 |
+| `maxLogFileBytes` | `8388608`（8 MiB） | **单会话**磁盘上限；达到上限时只重写该会话文件、保留最近约 1/4 的记录，不影响其它会话。 |
 | `cleanupOrphans` | `true` | 定时删除已归档/已删除会话及其派生子会话对应的孤儿 JSONL；读不到权威会话列表时会跳过。 |
 | `orphanSweepIntervalMs` | `60000`（60 秒） | 孤儿日志扫描间隔；插件启动后还会在约 1 秒时先扫一次。 |
 | `captureUnattributed` | `false` | 为 `true` 时，无法归属到会话的请求也会记录到 `unattributed` 桶。 |
-| `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择（macOS `open`、Windows `explorer.exe`、其它 `xdg-open`）。 |
+| `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择：macOS `open`、Windows `explorer.exe`、WSL 自动转换路径后用 Windows `explorer.exe`、其它 Linux `xdg-open`。 |
 
 ## 兼容性与版本约束
 

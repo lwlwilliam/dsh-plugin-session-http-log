@@ -21,7 +21,7 @@
  * @module @local/dsh-plugin-session-http-log
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -35,7 +35,7 @@ const DEFAULT_MAX_REQUESTS_PER_SESSION = 500
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
 const DEFAULT_MAX_SESSION_BYTES = 32 * 1024 * 1024
-const DEFAULT_MAX_LOG_FILE_BYTES = 64 * 1024 * 1024
+const DEFAULT_MAX_LOG_FILE_BYTES = 8 * 1024 * 1024
 /** 孤儿日志清理的默认扫描间隔。 */
 const DEFAULT_ORPHAN_SWEEP_INTERVAL_MS = 60 * 1000
 
@@ -113,7 +113,7 @@ const DATA_DIR_MARKER_CONTENT = [
   '',
   '- 卸载插件不会删除本目录，其中的记录会一直保留到手动清理。',
   '- 不再需要这些记录时，可以整体删除本目录，不会影响其他功能。',
-  '- 单个会话文件达到 maxLogFileBytes（默认 64 MiB）后会自动清理旧文件并重新写入。',
+  `- 单个会话文件达到 maxLogFileBytes（默认 ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB）后只保留最近一小段记录并重新写入。`,
   '- 此上限只影响单个会话，不会因为一个会话超限而删除其它会话的日志。',
   '- 归档或删除会话后，孤儿清理会删除对应的 jsonl 文件。',
   '- 凭据类请求头（authorization、cookie、api-key 等）默认已脱敏为 [redacted]。',
@@ -124,7 +124,8 @@ const DATA_DIR_MARKER_CONTENT = [
   '@local/dsh-plugin-session-http-log plugin, one <sessionId>.jsonl per session.',
   'Uninstalling the plugin does NOT delete them, and the directory is',
   'safe to delete wholesale once the captures are no longer needed.',
-  'Each session file is reset when it reaches maxLogFileBytes (default 64 MiB);',
+  `Each session file is reset when it reaches maxLogFileBytes (default ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB),`,
+  'keeping only its most recent records;',
   'this never deletes another session\'s file. Orphan cleanup removes files',
   'for archived or deleted sessions. Credential headers are redacted by default.',
   'The directory name stays "session-http-log" so a plugin rename never',
@@ -260,6 +261,67 @@ function defaultDataDir() {
   }
 }
 
+/**
+ * 判断当前 Host 是否运行在 WSL 中。WSL 会设置 `WSL_DISTRO_NAME`
+ * 或 `WSL_INTEROP`；仅凭 Linux 平台无法区分 WSL 与普通 Linux。
+ * @param {NodeJS.ProcessEnv|Record<string, string|undefined>} [env] - 环境变量。
+ * @returns {boolean}
+ */
+function isWslEnvironment(env = process.env) {
+  if (env === null || typeof env !== 'object') return false
+  return (
+    (typeof env.WSL_DISTRO_NAME === 'string' && env.WSL_DISTRO_NAME.trim() !== '') ||
+    (typeof env.WSL_INTEROP === 'string' && env.WSL_INTEROP.trim() !== '')
+  )
+}
+
+/**
+ * 在没有 `wslpath` 时把 Linux 路径转换为 Windows 可访问路径。
+ * `/mnt/c/...` 转为 `C:\...`，其它路径转为 `\\wsl.localhost\<distro>\...`。
+ * @param {string} dir - Linux 绝对路径。
+ * @param {NodeJS.ProcessEnv|Record<string, string|undefined>} [env] - 环境变量。
+ * @returns {string}
+ */
+function wslFallbackWindowsDirectory(dir, env = process.env) {
+  if (typeof dir !== 'string' || dir === '') return dir
+  const mounted = /^\/mnt\/([A-Za-z])(?:\/(.*))?$/.exec(dir)
+  if (mounted !== null) {
+    const rest = typeof mounted[2] === 'string' ? mounted[2].replace(/\//g, '\\') : ''
+    return `${mounted[1].toUpperCase()}:\\${rest}`
+  }
+  const distro =
+    env !== null && typeof env === 'object' && typeof env.WSL_DISTRO_NAME === 'string'
+      ? env.WSL_DISTRO_NAME.trim()
+      : ''
+  if (distro === '') return dir
+  const suffix = dir.replace(/^\/+/, '').replace(/\//g, '\\')
+  return `\\\\wsl.localhost\\${distro}\\${suffix}`
+}
+
+/**
+ * 用 `wslpath -w` 把数据目录转换为 Windows 路径，供 explorer.exe 打开。
+ * `wslpath` 不可用时回退到等价的 UNC / 盘符路径。
+ * @param {string} dir - Linux 绝对路径。
+ * @returns {Promise<string>} Windows 路径。
+ */
+function resolveWslWindowsDirectory(dir) {
+  return new Promise((resolve) => {
+    try {
+      execFile(
+        'wslpath',
+        ['-w', dir],
+        { encoding: 'utf8', timeout: 2000, windowsHide: true, maxBuffer: 64 * 1024 },
+        (error, stdout) => {
+          const converted = typeof stdout === 'string' ? stdout.trim() : ''
+          resolve(error === null && converted !== '' ? converted : wslFallbackWindowsDirectory(dir))
+        },
+      )
+    } catch {
+      resolve(wslFallbackWindowsDirectory(dir))
+    }
+  })
+}
+
 /* -------------------------------------------------------------------------- */
 /* 运行时                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -294,6 +356,8 @@ function createRuntime(ctx, config) {
   const accountedBytes = new WeakMap()
   /** 被字节预算淘汰的记录；迟到的捕获更新不得再计入。 */
   const evictedRecords = new WeakSet()
+  /** 已经写入当前会话 JSONL（普通追加或轮转重写）的记录。 */
+  const persistedRecords = new WeakSet()
   /** 中止所有进行中的捕获读取器；每次 install 时替换。 */
   let captureSignal = null
   /** 在 install 之前和 dispose 之后为 false；禁用新的捕获。 */
@@ -470,6 +534,8 @@ function createRuntime(ctx, config) {
       const size = estimateRecordBytes(record)
       accountedBytes.set(record, size)
       entry.bytes += size
+      // 这些行来自当前 JSONL；轮转时可以把它们作为安全的历史尾部重写。
+      persistedRecords.add(record)
     }
     enforceSessionBytes(entry)
   }
@@ -579,10 +645,74 @@ function createRuntime(ctx, config) {
   }
 
   /**
+   * 轮转时为当前会话重写一份最近记录，避免直接把整个文件清空。
+   * 只选取已完成记录（`completedAt !== null`）以及当前要写入的记录，
+   * 防止把仍在捕获中的记录提前持久化、随后又重复追加。
+   * @param {object[]} records - 会话内存桶中的记录。
+   * @param {object} current - 当前待持久化记录。
+   * @param {number} budget - 期望保留的字节预算。
+   * @returns {{ text: string, bytes: number, records: object[] }}
+   */
+  function rotationTail(records, current, budget) {
+    const selected = []
+    const selectedSet = new Set()
+    let total = 0
+    const add = (record) => {
+      if (record === null || typeof record !== 'object' || selectedSet.has(record)) return false
+      let line
+      try {
+        line = `${JSON.stringify(record)}\n`
+      } catch (error) {
+        reportOnce('persist-serialize', error)
+        return false
+      }
+      const bytes = Buffer.byteLength(line, 'utf8')
+      selected.push({ record, line })
+      selectedSet.add(record)
+      total += bytes
+      return true
+    }
+    add(current)
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const candidate = records[index]
+      if (
+        candidate === current ||
+        !persistedRecords.has(candidate) ||
+        candidate?.completedAt === null ||
+        candidate?.completedAt === undefined
+      ) {
+        continue
+      }
+      let line
+      try {
+        line = `${JSON.stringify(candidate)}\n`
+      } catch (error) {
+        reportOnce('persist-serialize', error)
+        continue
+      }
+      const bytes = Buffer.byteLength(line, 'utf8')
+      if (selected.length > 0 && total + bytes > budget) break
+      selected.push({ record: candidate, line })
+      total += bytes
+    }
+    selected.sort((left, right) => {
+      const leftId = Number.isInteger(left.record?.id) ? left.record.id : 0
+      const rightId = Number.isInteger(right.record?.id) ? right.record.id : 0
+      return leftId - rightId
+    })
+    return {
+      text: selected.map((entry) => entry.line).join(''),
+      bytes: total,
+      records: selected.map((entry) => entry.record),
+    }
+  }
+
+  /**
    * 把一条完成的记录追加到会话文件，按文件串行化。
    * 文件上限为 `maxLogFileBytes`：每个会话测量一次大小，之后按追加的
-   * 字节长度累计。超过上限时只删除该会话的旧 JSONL 并从头继续写；
-   * 其他会话完全不受影响，也绝不影响捕获、路由或 fetch 调用方。
+   * 字节长度累计。超过上限时只重写这个会话最近的少量记录，而不是把
+   * 整个历史直接丢弃；其它会话完全不受影响，也绝不影响捕获、路由或
+   * fetch 调用方。
    * @param {string} sessionId - 会话 id。
    * @param {object} record - 已完成的内部记录。
    */
@@ -603,18 +733,28 @@ function createRuntime(ctx, config) {
       .then(async () => {
         if (entry.logBytes === null) entry.logBytes = await fileSize(file)
         if (entry.logBytes > 0 && entry.logBytes + bytes > config.maxLogFileBytes) {
-          // 单会话磁盘上限：只删除这个会话的旧 JSONL，然后从当前记录重新写。
-          // 其它会话的文件完全不受影响；内存里的记录也仍由面板照常展示。
+          // 单会话磁盘上限：保留最近约 1/4 上限的记录（最多 2 MiB），
+          // 然后继续追加后续记录。其它会话的文件完全不受影响。
+          const tailBudget = Math.max(
+            1024,
+            Math.min(2 * 1024 * 1024, Math.floor(config.maxLogFileBytes / 4)),
+          )
+          const tail = rotationTail(entry.records, record, tailBudget)
           try {
             await unlink(file)
           } catch (error) {
             if (error?.code !== 'ENOENT') throw error
           }
-          entry.logBytes = 0
+          await mkdir(dirname(file), { recursive: true })
+          await writeFile(file, tail.text, 'utf8')
+          entry.logBytes = tail.bytes
+          for (const persisted of tail.records) persistedRecords.add(persisted)
+          return
         }
         await mkdir(dirname(file), { recursive: true })
         await appendFile(file, line, 'utf8')
         entry.logBytes += bytes
+        persistedRecords.add(record)
       })
       .catch((error) => {
         reportOnce(`persist:${file}`, error)
@@ -1241,12 +1381,15 @@ function createRuntime(ctx, config) {
   /**
    * 解析 reveal 路由使用的可执行文件：优先配置覆盖，
    * 否则使用平台默认值（`open`、`explorer.exe`、`xdg-open`）。
+   * WSL 必须使用 Windows 侧的 `explorer.exe`，因为 WSL 里的浏览器
+   * 由 Windows 打开，而 `xdg-open` 通常不可用或无法打开 Linux 路径。
    * @returns {string}
    */
   function openDirectoryCommand() {
     if (config.openDirectoryCommand !== '') return config.openDirectoryCommand
     if (process.platform === 'darwin') return 'open'
     if (process.platform === 'win32') return 'explorer.exe'
+    if (isWslEnvironment()) return 'explorer.exe'
     return 'xdg-open'
   }
 
@@ -1255,14 +1398,15 @@ function createRuntime(ctx, config) {
    * 子进程报告成功 spawn 后即 resolve；spawn 出错（例如可执行文件缺失）时 reject；
    * `REVEAL_SPAWN_WATCH_MS` 计时器为两者都不报告的平台
    * 提供有界兜底。
-   * @param {string} dir - 要打开的目录（始终是配置的数据目录）。
+   * @param {string} command - 可执行文件。
+   * @param {string[]} args - 参数。
    * @returns {Promise<void>}
    */
-  function openDirectory(dir) {
+  function spawnDetached(command, args) {
     return new Promise((resolve, reject) => {
       let child
       try {
-        child = spawn(openDirectoryCommand(), [dir], {
+        child = spawn(command, args, {
           detached: true,
           stdio: 'ignore',
           windowsHide: true,
@@ -1296,6 +1440,51 @@ function createRuntime(ctx, config) {
       timer = setTimeout(() => finish(), REVEAL_SPAWN_WATCH_MS)
       if (typeof timer.unref === 'function') timer.unref()
     })
+  }
+
+  /**
+   * 在系统文件管理器中打开数据目录。
+   * - 普通 Linux：`xdg-open`；
+   * - WSL：把 Linux 路径转成 Windows 路径后交给 `explorer.exe`，
+   *   并在 PATH 中没有 Windows interop 时尝试挂载盘上的 explorer.exe；
+   * - 自定义 `openDirectoryCommand` 时保持原样，只传 Linux 目录。
+   * @param {string} dir - 要打开的目录（始终是配置的数据目录）。
+   * @returns {Promise<void>}
+   */
+  async function openDirectory(dir) {
+    /** @type {Array<{ command: string, args: string[] }>} */
+    const candidates = []
+    if (config.openDirectoryCommand !== '') {
+      candidates.push({ command: config.openDirectoryCommand, args: [dir] })
+    } else if (process.platform === 'darwin') {
+      candidates.push({ command: 'open', args: [dir] })
+    } else if (process.platform === 'win32') {
+      candidates.push({ command: 'explorer.exe', args: [dir] })
+    } else if (isWslEnvironment()) {
+      const windowsDir = await resolveWslWindowsDirectory(dir)
+      candidates.push({ command: openDirectoryCommand(), args: [windowsDir] })
+      // 某些 WSL 配置不会把 Windows PATH 注入 Linux；直接调用挂载盘里的
+      // explorer.exe 仍能通过 WSL interop 打开 \\wsl.localhost\... 路径。
+      candidates.push({ command: '/mnt/c/Windows/explorer.exe', args: [windowsDir] })
+      candidates.push({ command: 'wslview', args: [dir] })
+      candidates.push({ command: 'xdg-open', args: [dir] })
+    } else {
+      candidates.push({ command: 'xdg-open', args: [dir] })
+    }
+
+    let lastError = null
+    for (const candidate of candidates) {
+      try {
+        await spawnDetached(candidate.command, candidate.args)
+        return
+      } catch (error) {
+        lastError = error
+        // 只有“命令不存在”才值得换下一个候选；权限等错误直接上报。
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
+    if (lastError !== null) throw lastError
+    throw new Error('no directory opener is available')
   }
 
   /** 各路由共用的 400 响应：会话 id 缺失或格式错误。 */

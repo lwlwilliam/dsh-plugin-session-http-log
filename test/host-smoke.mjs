@@ -12,7 +12,7 @@
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { strict as assert } from 'node:assert'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const { apply } = await import(new URL('../index.js', import.meta.url).href)
@@ -192,7 +192,7 @@ assert.ok(feed.totalBytes > 0, 'session total stored bytes reported')
 assert.equal(feed.fileBytes, null, 'no persisted file size when persistence is off')
 assert.equal(feed.dir, dataDir, 'data directory reported')
 assert.equal(feed.persist, false, 'persistence flag reported')
-assert.equal(feed.maxLogFileBytes, 64 * 1024 * 1024, 'per-session disk cap reported')
+assert.equal(feed.maxLogFileBytes, 8 * 1024 * 1024, 'per-session disk cap reported')
 
 const detail = await callRoute('/api/dsh-plugin-session-http-log/record', {
   query: `?sessionId=session-test&id=${summary.id}`,
@@ -268,6 +268,57 @@ for (const cleanup of cleanups.splice(0)) cleanup()
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored on dispose')
 assert.equal(routes.size, 0, 'routes removed on dispose')
 
+// 7b. WSL reveal: convert the Linux data directory to a Windows path and
+// launch Windows Explorer, even though process.platform is linux.
+const wslRoot = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-wsl-'))
+const fakeBin = join(wslRoot, 'bin')
+const wslDataDir = join(wslRoot, 'records')
+const revealCapture = join(wslRoot, 'explorer-args.txt')
+const windowsDir = String.raw`\\wsl.localhost\Ubuntu\home\go\.dsh\session-http-log`
+await mkdir(fakeBin, { recursive: true })
+const fakeWslpath = join(fakeBin, 'wslpath')
+const fakeExplorer = join(fakeBin, 'explorer.exe')
+await writeFile(fakeWslpath, '#!/bin/sh\nprintf \'%s\\n\' "$DSH_TEST_WINDOWS_DIR"\n', 'utf8')
+await writeFile(fakeExplorer, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$DSH_TEST_REVEAL_CAPTURE"\n', 'utf8')
+await chmod(fakeWslpath, 0o755)
+await chmod(fakeExplorer, 0o755)
+const savedEnv = {
+  PATH: process.env.PATH,
+  WSL_DISTRO_NAME: process.env.WSL_DISTRO_NAME,
+  WSL_INTEROP: process.env.WSL_INTEROP,
+  DSH_TEST_WINDOWS_DIR: process.env.DSH_TEST_WINDOWS_DIR,
+  DSH_TEST_REVEAL_CAPTURE: process.env.DSH_TEST_REVEAL_CAPTURE,
+}
+process.env.PATH = `${fakeBin}:${savedEnv.PATH ?? ''}`
+process.env.WSL_DISTRO_NAME = 'Ubuntu'
+process.env.WSL_INTEROP = '/run/WSL/1_interop'
+process.env.DSH_TEST_WINDOWS_DIR = windowsDir
+process.env.DSH_TEST_REVEAL_CAPTURE = revealCapture
+try {
+  apply(fakeCtx, { ...config, persist: false, dataDir: wslDataDir, openDirectoryCommand: '' })
+  assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for WSL reveal run')
+  const wslRevealed = await callRoute('/api/dsh-plugin-session-http-log/reveal', { method: 'POST' })
+  assert.equal(wslRevealed.status, 200)
+  assert.equal(wslRevealed.json.dir, wslDataDir)
+  const openedTarget = await waitFor(async () => {
+    try {
+      return (await readFile(revealCapture, 'utf8')).trim()
+    } catch {
+      return ''
+    }
+  }, 'WSL explorer launch')
+  assert.equal(openedTarget, windowsDir, 'WSL reveal passes a Windows path to explorer.exe')
+} finally {
+  for (const cleanup of cleanups.splice(0)) cleanup()
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  await rm(wslRoot, { recursive: true, force: true })
+}
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after WSL reveal run')
+assert.equal(routes.size, 0, 'routes removed after WSL reveal run')
+
 // 8. byte budget: oldest records are evicted once stored body bytes exceed maxSessionBytes.
 apply(fakeCtx, { ...config, maxSessionBytes: 2048, maxRequestsPerSession: 50 })
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed again')
@@ -318,36 +369,44 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after marker run')
 assert.equal(routes.size, 0, 'routes removed after marker run')
 await rm(markerDir, { recursive: true, force: true })
 
-// 10. maxLogFileBytes rotates only the oversized session file.
+// 10. maxLogFileBytes rotates only the oversized session file, retaining a
+// recent tail instead of discarding every prior in-memory record.
 const trimDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-trim-'))
 knownSessionIds.add('session-trim')
 workspaceRegistry.archivedSessionIds = []
 const trimPath = join(trimDir, 'session-trim.jsonl')
-const sentinel = 'old-log-sentinel-' + 'x'.repeat(8192)
+const sentinel = 'old-log-sentinel-' + 'x'.repeat(16384)
 await writeFile(trimPath, sentinel + '\n', 'utf8')
 apply(fakeCtx, {
   ...config,
   persist: true,
   dataDir: trimDir,
-  maxLogFileBytes: 4096,
+  maxLogFileBytes: 8192,
   orphanSweepIntervalMs: 60_000,
 })
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for trim run')
 initiator = { id: 'session-trim' }
-await (await globalThis.fetch(`${base}/json`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ q: 'trim' }),
-})).text()
+for (let index = 0; index < 12; index += 1) {
+  await (await globalThis.fetch(`${base}/json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ q: `trim-${index}` }),
+  })).text()
+}
 const trimmedText = await waitFor(async () => {
   try {
     const text = await readFile(trimPath, 'utf8')
-    return text.includes('trim') && !text.includes('old-log-sentinel-') ? text : null
+    return text.includes('trim-11') && !text.includes('old-log-sentinel-') ? text : null
   } catch {
     return null
   }
 }, 'per-session log rotation')
 assert.ok(Buffer.byteLength(trimmedText, 'utf8') < Buffer.byteLength(sentinel, 'utf8'), 'old oversized file was replaced')
+const retainedLines = trimmedText.trim().split('\n').map((line) => JSON.parse(line))
+assert.ok(retainedLines.length >= 2, `rotation keeps a recent tail (kept ${retainedLines.length})`)
+assert.ok(retainedLines.some((line) => JSON.stringify(line).includes('trim-10')), 'rotation keeps a pre-rotation record')
+const retainedIds = retainedLines.map((line) => line.id)
+assert.deepEqual(retainedIds.slice().sort((a, b) => a - b), retainedIds, 'retained log ids stay ordered')
 for (const cleanup of cleanups.splice(0)) cleanup()
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after trim run')
 assert.equal(routes.size, 0, 'routes removed after trim run')

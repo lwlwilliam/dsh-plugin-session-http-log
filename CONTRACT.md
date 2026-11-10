@@ -78,7 +78,7 @@ maxResponseBodyBytes: 4 * 1024 * 1024
 redactSensitiveHeaders: true
 persist: true
 dataDir: ''            // 默认：$DSH_HOME/session-http-log（回退 ~/.dsh/session-http-log）
-maxLogFileBytes: 64 * 1024 * 1024   // 单会话磁盘上限；达到后只重置本会话 JSONL
+maxLogFileBytes: 8 * 1024 * 1024    // 单会话磁盘上限；达到后只重写本会话并保留最近尾部
 cleanupOrphans: true                // 定时删除已归档/已删除会话的孤儿 JSONL
 orphanSweepIntervalMs: 60 * 1000    // 孤儿扫描间隔；启动后约 1 秒先扫一次
 captureUnattributed: false          // 为 true 时，无 initiator 的请求记入 "unattributed"
@@ -117,8 +117,10 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
    - `Map<sessionId, { nextId, records: Record[], bytes, loadedFromDisk }>`；记录按
      `maxRequestsPerSession` 和 `maxSessionBytes` 双上限淘汰最旧记录（至少保留最新一条）。
    - 可选持久化：每条完成记录追加一行 JSON 到 `<dataDir>/<清洗后的 sessionId>.jsonl`
-     （递归建目录；同一 session 串行追加；fire-and-forget 且捕获错误）。首次读取某会话且内存
-     为空时，从文件加载最后 `maxRequestsPerSession` 条完整行，并按同样的字节预算裁剪。
+     （递归建目录；同一 session 串行追加；fire-and-forget 且捕获错误）。单文件达到
+     `maxLogFileBytes` 时只重写该会话文件，保留最近约 1/4 上限的已完成记录（至少保留当前记录），
+     不影响其它会话。首次读取某会话且内存为空时，从文件加载最后
+     `maxRequestsPerSession` 条完整行，并按同样的字节预算裁剪。
    - `clear(sessionId)` 清空内存并删除/清空文件。
 
 3. **HTTP 路由**（每个都在 `ctx.effect(...)` 中注册并返回 disposer；`requestBody:'buffered'`）。
@@ -133,7 +135,9 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
    - `GET /api/dsh-plugin-session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404
    - `POST /api/dsh-plugin-session-http-log/clear` body `{ "sessionId": "…" }` → `{ ok: true, removed: n }`
    - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
-     目录（平台默认或 `openDirectoryCommand`）；失败返回 500 `{ error }`。
+     目录（平台默认或 `openDirectoryCommand`）。WSL 下必须把 Linux 路径转换为 Windows 路径
+     （优先 `wslpath -w`，回退到 `/mnt/<drive>` 或 `\\wsl.localhost\<distro>`），再交给 Windows
+     `explorer.exe`；失败返回 500 `{ error }`。
    - `GET /api/dsh-plugin-session-http-log/har?sessionId=…` → HAR 1.2 对象
      `{ log: { version: '1.2', creator: { name: 'dsh-plugin-session-http-log', version: '0.1.0' },
      entries: [ … ] } }`；`content-type: application/json`，`content-disposition:
@@ -194,7 +198,7 @@ window.__ModuleLoader__.load({
   `api/dsh-plugin-session-http-log/clear`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
 - 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空、导出、打开目录）；
   持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示
-  `maxLogFileBytes` 是单会话磁盘上限、达到后会清理本会话旧日志；不得暗示会清理其它会话。
+  `maxLogFileBytes` 是单会话磁盘上限、达到后会重写本会话并保留最近记录；不得暗示会清理其它会话。
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。
 - 行：方法 chip、路径（tooltip 为完整 URL）、按状态着色的状态 chip（2xx success、3xx idle、
@@ -217,8 +221,9 @@ window.__ModuleLoader__.load({
    `effect(cb)` 立即执行并保留 cleanup；对本地 `node:http` 服务器安装插件；调用
    `fetch(url, { method:'POST', body: JSON.stringify({model:'m'}), headers })`；断言抓到的记录
    含原始请求/响应文本、请求头、计时、`kind:'llm'`；断言 list/detail/clear/HAR/reveal 路由；
-   断言字节预算淘汰、单会话超 `maxLogFileBytes` 后旧文件被重置且能继续写、
-   未知/已归档会话的 JSONL 被孤儿清理且有效文件保留；dispose 后 `globalThis.fetch` 还原。
+   断言字节预算淘汰、单会话超 `maxLogFileBytes` 后旧文件被重写且保留最近尾部并继续写、
+   WSL reveal 把 Windows 路径传给 `explorer.exe`、未知/已归档会话的 JSONL 被孤儿清理且有效
+   文件保留；dispose 后 `globalThis.fetch` 还原。
 3. Client 冒烟测试（`test/client-smoke.mjs`）：伪 React + 伪客户端上下文加载真实 `client.js`，
    断言 tab/pane 注册、en/zh 字典完整性、视图渲染、主题 token 使用。
 4. `plugin_manager install_bundle` 安装 bundle，再用 `cordis_inspect_query Config.listConfigs`
