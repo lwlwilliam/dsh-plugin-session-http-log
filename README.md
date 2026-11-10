@@ -1,4 +1,4 @@
-# DeepSeek Harness 会话 HTTP 记录插件(DeepSeek Harness Session HTTP log plugin）
+# DeepSeek Harness 会话 HTTP 记录插件
 
 一个 DeepSeek Harness 插件 bundle：把**某个会话真实发出的 HTTP 报文**原样记录下来，并在右侧边栏提供查看界面。
 
