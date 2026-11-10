@@ -100,6 +100,8 @@ window.__ModuleLoader__.load({
       'section.collapse': 'Collapse section',
       'header.space': '{memory} occupied',
       'header.spaceTooltip': 'Memory estimate: {memory}\nOn disk: {disk}\nDirectory: {dir}',
+      'header.retention': 'Disk cap for this session: {limit}. When reached, old capture data is cleared automatically.',
+      'header.retentionTitle': 'Only this session\'s JSONL is reset. Other sessions are never touched, and the list already loaded in this panel stays available until refresh.',
       'header.spaceUninstallNote': 'Uninstalling the plugin does not delete this directory.',
       'header.notPersisted': 'not persisted',
       'header.openFolder': 'Open folder',
@@ -180,6 +182,8 @@ window.__ModuleLoader__.load({
       'section.collapse': '收起此区块',
       'header.space': '占用 {memory}',
       'header.spaceTooltip': '内存估算：{memory}\n磁盘：{disk}\n目录：{dir}',
+      'header.retention': '单会话磁盘上限 {limit}：达到上限后会自动清理旧日志。',
+      'header.retentionTitle': '只会重置当前会话的 JSONL，绝不影响其它会话；当前面板已加载的列表也会保留，直到刷新。',
       'header.spaceUninstallNote': '卸载插件不会删除该目录。',
       'header.notPersisted': '未持久化',
       'header.openFolder': '打开目录',
@@ -217,6 +221,7 @@ window.__ModuleLoader__.load({
       '.shl-btn-ghost:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}',
       '.shl-btn-danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}',
       '.shl-btn-danger:hover{background:var(--dsw-alias-bg-overlay)}',
+      '.shl-retention{font-size:12px;font-weight:700;line-height:1.45;color:var(--dsw-alias-state-warn-primary);overflow-wrap:anywhere;padding:0 1px}',
       '.shl-filter{width:100%;min-width:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px}',
       '.shl-filter::placeholder{color:var(--dsw-alias-label-secondary)}',
       '.shl-filter:focus{outline:none;border-color:var(--dsw-alias-brand-primary);box-shadow:0 0 0 1px var(--dsw-alias-brand-primary)}',
@@ -551,6 +556,10 @@ window.__ModuleLoader__.load({
         totalBytes: typeof payload.totalBytes === 'number' && isFinite(payload.totalBytes) ? payload.totalBytes : 0,
         fileBytes: typeof payload.fileBytes === 'number' && isFinite(payload.fileBytes) ? payload.fileBytes : null,
         dir: typeof payload.dir === 'string' ? payload.dir : '',
+        persist: payload.persist === true,
+        maxLogFileBytes: typeof payload.maxLogFileBytes === 'number' && isFinite(payload.maxLogFileBytes) && payload.maxLogFileBytes > 0
+          ? payload.maxLogFileBytes
+          : 0,
       }
     }
 
@@ -875,6 +884,8 @@ window.__ModuleLoader__.load({
       const [totalBytes, setTotalBytes] = React.useState(0)
       const [fileBytes, setFileBytes] = React.useState(null)
       const [dir, setDir] = React.useState('')
+      const [persist, setPersist] = React.useState(false)
+      const [maxLogFileBytes, setMaxLogFileBytes] = React.useState(0)
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState(null)
       const [nonce, setNonce] = React.useState(0)
@@ -900,6 +911,8 @@ window.__ModuleLoader__.load({
             setTotalBytes(snapshot.totalBytes)
             setFileBytes(snapshot.fileBytes)
             setDir(snapshot.dir)
+            setPersist(snapshot.persist)
+            setMaxLogFileBytes(snapshot.maxLogFileBytes)
             setError(null)
           } catch (caught) {
             if (cancelled || isAbortError(caught)) return
@@ -925,6 +938,8 @@ window.__ModuleLoader__.load({
         totalBytes,
         fileBytes,
         dir,
+        persist,
+        maxLogFileBytes,
         loading,
         error,
         refresh: () => setNonce((value) => value + 1),
@@ -1243,6 +1258,13 @@ window.__ModuleLoader__.load({
               title: t('header.openFolderTitle'),
               'aria-label': t('header.openFolderTitle'),
             }, revealing ? t('header.opening') : revealFeedback === 'opened' ? t('header.opened') : t('header.openFolder'))),
+          feed.persist && feed.maxLogFileBytes > 0
+            ? h('div', {
+              className: 'shl-retention',
+              role: 'note',
+              title: t('header.retentionTitle'),
+            }, t('header.retention', { limit: formatBytes(feed.maxLogFileBytes) }))
+            : null,
           confirmClear
             ? h('div', { className: 'shl-banner' },
               h('span', { className: 'shl-banner-text' }, t('header.clearConfirm')),

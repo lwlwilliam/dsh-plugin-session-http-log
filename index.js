@@ -22,7 +22,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { appendFile, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -36,6 +36,8 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
 const DEFAULT_MAX_SESSION_BYTES = 32 * 1024 * 1024
 const DEFAULT_MAX_LOG_FILE_BYTES = 64 * 1024 * 1024
+/** 孤儿日志清理的默认扫描间隔。 */
+const DEFAULT_ORPHAN_SWEEP_INTERVAL_MS = 60 * 1000
 
 /** 提供给属主浏览器的精确 fetch 路由。 */
 const ROUTE_PATHS = Object.freeze({
@@ -111,7 +113,9 @@ const DATA_DIR_MARKER_CONTENT = [
   '',
   '- 卸载插件不会删除本目录，其中的记录会一直保留到手动清理。',
   '- 不再需要这些记录时，可以整体删除本目录，不会影响其他功能。',
-  '- 单个会话文件的写入达到 maxLogFileBytes（默认 64 MiB）后会停止。',
+  '- 单个会话文件达到 maxLogFileBytes（默认 64 MiB）后会自动清理旧文件并重新写入。',
+  '- 此上限只影响单个会话，不会因为一个会话超限而删除其它会话的日志。',
+  '- 归档或删除会话后，孤儿清理会删除对应的 jsonl 文件。',
   '- 凭据类请求头（authorization、cookie、api-key 等）默认已脱敏为 [redacted]。',
   '- 清理某个会话只会删除对应的 jsonl 文件，本说明文件会保留。',
   '- 目录名沿用 session-http-log：插件改名不会迁移本目录，以免已有数据丢失。',
@@ -120,8 +124,9 @@ const DATA_DIR_MARKER_CONTENT = [
   '@local/dsh-plugin-session-http-log plugin, one <sessionId>.jsonl per session.',
   'Uninstalling the plugin does NOT delete them, and the directory is',
   'safe to delete wholesale once the captures are no longer needed.',
-  'Per-session writes stop at maxLogFileBytes (default 64 MiB), and',
-  'credential headers are redacted by default.',
+  'Each session file is reset when it reaches maxLogFileBytes (default 64 MiB);',
+  'this never deletes another session\'s file. Orphan cleanup removes files',
+  'for archived or deleted sessions. Credential headers are redacted by default.',
   'The directory name stays "session-http-log" so a plugin rename never',
   'orphans existing captures.',
   '',
@@ -169,6 +174,22 @@ export function apply(ctx, config = {}) {
   }
   // 说明文件是尽力而为的副产物：不 await，失败只记日志，绝不影响激活。
   runtime.writeDirectoryMarker()
+  // 会话可能在本进程运行期间被归档或删除；定时扫描一次数据目录，
+  // 删掉已没有对应会话的 JSONL。扫描只碰本插件命名的 *.jsonl，
+  // 且读不到权威会话列表时会安全跳过。
+  ctx.effect(() => {
+    if (runtime.cleanupOrphans !== true) return () => {}
+    let initialTimer = null
+    const sweep = () => { void runtime.sweepOrphanLogs() }
+    initialTimer = setTimeout(sweep, 1000)
+    if (typeof initialTimer.unref === 'function') initialTimer.unref()
+    const interval = setInterval(sweep, runtime.orphanSweepIntervalMs)
+    if (typeof interval.unref === 'function') interval.unref()
+    return () => {
+      if (initialTimer !== null) clearTimeout(initialTimer)
+      clearInterval(interval)
+    }
+  }, 'dsh-plugin-session-http-log: orphan log cleanup')
 }
 
 /* -------------------------------------------------------------------------- */
@@ -185,6 +206,8 @@ export function apply(ctx, config = {}) {
  *   maxResponseBodyBytes: number,
  *   maxSessionBytes: number,
  *   maxLogFileBytes: number,
+ *   cleanupOrphans: boolean,
+ *   orphanSweepIntervalMs: number,
  *   redactSensitiveHeaders: boolean,
  *   persist: boolean,
  *   captureUnattributed: boolean,
@@ -201,6 +224,8 @@ function resolveConfig(raw) {
     maxResponseBodyBytes: positiveInteger(input.maxResponseBodyBytes, DEFAULT_MAX_RESPONSE_BODY_BYTES),
     maxSessionBytes: positiveInteger(input.maxSessionBytes, DEFAULT_MAX_SESSION_BYTES),
     maxLogFileBytes: positiveInteger(input.maxLogFileBytes, DEFAULT_MAX_LOG_FILE_BYTES),
+    cleanupOrphans: input.cleanupOrphans !== false,
+    orphanSweepIntervalMs: positiveInteger(input.orphanSweepIntervalMs, DEFAULT_ORPHAN_SWEEP_INTERVAL_MS),
     redactSensitiveHeaders: input.redactSensitiveHeaders !== false,
     persist: input.persist !== false,
     captureUnattributed: input.captureUnattributed === true,
@@ -273,6 +298,8 @@ function createRuntime(ctx, config) {
   let captureSignal = null
   /** 在 install 之前和 dispose 之后为 false；禁用新的捕获。 */
   let captureEnabled = false
+  /** 防止定时器和手动触发产生重叠的孤儿扫描。 */
+  let sweepingOrphans = false
 
   /* ---------------------------------------------------------------- 日志    */
 
@@ -553,10 +580,9 @@ function createRuntime(ctx, config) {
 
   /**
    * 把一条完成的记录追加到会话文件，按文件串行化。
-   * 文件上限为 `maxLogFileBytes`：每个会话测量一次大小，
-   * 之后按追加的字节长度累计。达到上限即停止该会话的持久化
-   * （只上报一次），但绝不影响捕获、
-   * 路由或 fetch 调用方。
+   * 文件上限为 `maxLogFileBytes`：每个会话测量一次大小，之后按追加的
+   * 字节长度累计。超过上限时只删除该会话的旧 JSONL 并从头继续写；
+   * 其他会话完全不受影响，也绝不影响捕获、路由或 fetch 调用方。
    * @param {string} sessionId - 会话 id。
    * @param {object} record - 已完成的内部记录。
    */
@@ -576,12 +602,15 @@ function createRuntime(ctx, config) {
     const next = previous
       .then(async () => {
         if (entry.logBytes === null) entry.logBytes = await fileSize(file)
-        if (entry.logBytes + bytes > config.maxLogFileBytes) {
-          reportOnce(
-            `persist-limit:${file}`,
-            new Error(`persistence stopped: log file would exceed ${config.maxLogFileBytes} bytes`),
-          )
-          return
+        if (entry.logBytes > 0 && entry.logBytes + bytes > config.maxLogFileBytes) {
+          // 单会话磁盘上限：只删除这个会话的旧 JSONL，然后从当前记录重新写。
+          // 其它会话的文件完全不受影响；内存里的记录也仍由面板照常展示。
+          try {
+            await unlink(file)
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error
+          }
+          entry.logBytes = 0
         }
         await mkdir(dirname(file), { recursive: true })
         await appendFile(file, line, 'utf8')
@@ -641,6 +670,134 @@ function createRuntime(ctx, config) {
     entry.logBytes = null
     entry.bytes = 0
     return removed
+  }
+
+  /* -------------------------------------------------------------- 孤儿清理    */
+
+  /**
+   * 收集当前仍然有效、且没有归档的会话 id。
+   * 返回 null 表示无法取得权威会话列表；调用方必须放弃本轮清理，
+   * 绝不能把“服务暂时不可用”误判成“所有会话都已删除”。
+   * @returns {Promise<Set<string>|null>}
+   */
+  async function knownSessionIds() {
+    // 不能把 sessions Map 里的所有桶都当成有效会话：它们可能只是插件内存里
+    // 尚未释放的历史桶，真实 Session 已经删除。权威来源必须是 live Session
+    // 与 sessionPersistence；正在读写中的桶另行通过 pending 检查保护。
+    const known = new Set()
+    /** `Map<childSessionId, parentSessionId>`：用于把子代理/团队日志跟着父会话清理。 */
+    const parentBySession = new Map()
+    try {
+      const liveSessions = ctx.get('sessions')
+      if (liveSessions !== undefined && typeof liveSessions.list === 'function') {
+        for (const session of liveSessions.list()) {
+          const id = session !== null && typeof session === 'object' ? session.id : session
+          if (typeof id !== 'string' || id === '') continue
+          known.add(id)
+          const parent = session?.header?.parentSession
+          if (typeof parent === 'string' && parent !== '') parentBySession.set(id, parent)
+        }
+      }
+    } catch {
+      return null
+    }
+    try {
+      const persistence = ctx.get('sessionPersistence')
+      if (persistence === undefined || typeof persistence.list !== 'function') return null
+      const stored = await persistence.list()
+      if (!Array.isArray(stored)) return null
+      for (const snapshot of stored) {
+        // SessionPersistenceSnapshot 的权威身份在 header.id；兼容旧形态的 id。
+        const header = snapshot !== null && typeof snapshot === 'object' ? snapshot.header : undefined
+        const id = header !== null && typeof header === 'object' ? header.id : snapshot?.id
+        if (typeof id !== 'string' || id === '') continue
+        known.add(id)
+        const parent = header?.parentSession
+        if (typeof parent === 'string' && parent !== '') parentBySession.set(id, parent)
+      }
+    } catch (error) {
+      reportOnce('orphan-known-sessions', error)
+      return null
+    }
+    // 归档会话仍在 sessionPersistence 中，但用户已经把它从会话列表移走；
+    // 按本插件的保留策略，抓包数据一并清理，避免长期残留。
+    try {
+      const workspaceRegistry = ctx.get('workspaceRegistry')
+      const archived = workspaceRegistry?.archivedSessionIds
+      if (Array.isArray(archived)) {
+        for (const id of archived) {
+          if (typeof id === 'string') known.delete(id)
+        }
+      }
+    } catch (error) {
+      reportOnce('orphan-archived-sessions', error)
+      return null
+    }
+    // 父会话被归档/删除时，连同其派生的智能体团队/子代理会话一起清理；
+    // 迭代到不动点以覆盖多层子代理。
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const [id, parent] of parentBySession) {
+        if (known.has(id) && !known.has(parent)) {
+          known.delete(id)
+          changed = true
+        }
+      }
+    }
+    return known
+  }
+
+  /**
+   * 扫描数据目录，删除不属于任何有效/未归档会话的 `.jsonl` 文件。
+   * 只处理文件名严格符合会话 id 规则的 JSONL；README、未知文件和
+   * `unattributed` 桶都保留。扫描绝不会让插件激活失败。
+   * @returns {Promise<void>}
+   */
+  async function sweepOrphanLogs() {
+    if (config.persist !== true || config.cleanupOrphans !== true || sweepingOrphans) return
+    sweepingOrphans = true
+    try {
+      const known = await knownSessionIds()
+      if (known === null) return
+      let entries
+      try {
+        entries = await readdir(config.dataDir, { withFileTypes: true })
+      } catch (error) {
+        if (error?.code !== 'ENOENT') reportOnce('orphan-readdir', error)
+        return
+      }
+      for (const entry of entries) {
+        if (entry === null || typeof entry !== 'object' || entry.isFile?.() !== true) continue
+        const name = String(entry.name)
+        if (!name.endsWith('.jsonl')) continue
+        const sessionId = name.slice(0, -'.jsonl'.length)
+        if (sessionId === UNATTRIBUTED_SESSION) continue
+        if (!SESSION_ID_PATTERN.test(sessionId) || known.has(sessionId)) continue
+        const activeEntry = sessions.get(sessionId)
+        if (activeEntry !== undefined && activeEntry.pending.size > 0) continue
+        const file = join(config.dataDir, name)
+        const pendingWrite = pendingWrites.get(file)
+        if (pendingWrite !== undefined) {
+          try {
+            await pendingWrite
+          } catch {
+            /* 追加失败已经上报过 */
+          }
+        }
+        try {
+          await unlink(file)
+          sessions.delete(sessionId)
+          pendingWrites.delete(file)
+        } catch (error) {
+          if (error?.code !== 'ENOENT') reportOnce(`orphan-unlink:${file}`, error)
+        }
+      }
+    } catch (error) {
+      reportOnce('orphan-sweep', error)
+    } finally {
+      sweepingOrphans = false
+    }
   }
 
   /* -------------------------------------------------------------- 归属判定    */
@@ -980,6 +1137,8 @@ function createRuntime(ctx, config) {
       totalBytes: entry.bytes,
       fileBytes: await sessionFileBytes(sessionId),
       dir: config.dataDir,
+      persist: config.persist === true,
+      maxLogFileBytes: config.maxLogFileBytes,
       records: selected.map(summarizeRecord),
     })
   }
@@ -1263,7 +1422,7 @@ function createRuntime(ctx, config) {
     { path: ROUTE_PATHS.reveal, methods: ['POST'], handler: handleRevealRequest },
   ]
 
-  return { install, registerRoute, routes, writeDirectoryMarker }
+  return { install, registerRoute, routes, writeDirectoryMarker, sweepOrphanLogs, cleanupOrphans: config.cleanupOrphans && config.persist, orphanSweepIntervalMs: config.orphanSweepIntervalMs }
 }
 
 /* -------------------------------------------------------------------------- */

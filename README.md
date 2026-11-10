@@ -30,6 +30,7 @@ Harness 的 initiator 链归属到对应会话。
 - 请求体、响应体默认显示**原始报文**，JSON 可切换美化显示；支持复制、复制为 cURL；
 - 请求/响应超过截断阈值、或响应体为二进制（base64）时会显示标记；
 - 顶部显示本会话的请求数与**总体占用空间**（鼠标悬停可看磁盘文件大小与保存目录）；
+- 顶部用**加粗警示文字**显示单会话磁盘上限：达到 `maxLogFileBytes` 后只会自动清理当前会话的旧日志；
 - 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录；
 - **筛选** 支持按方法、URL、状态码、模型或类型过滤；
 - **导出 HAR** 会下载 HAR 1.2 文件；**清空** 会删除本会话的内存记录与磁盘文件。
@@ -223,8 +224,19 @@ rm -rf <本包目录>                                         # 如不再需要�
 - 面板里的“占用空间”是本会话记录在内存中的估算大小；悬停提示里的“磁盘”是上述 JSONL 的
   实际大小；点击 **打开目录** 可直接定位。
 - 也可以设置 `persist: false` 只保留内存记录；此时悬停提示会显示“未持久化”。
-- 单个会话文件超过 `maxLogFileBytes`（默认 64 MiB）后停止继续写盘并只告警一次，但内存中的
-  记录、面板列表与 HTTP 路由仍然正常；此时“占用空间”与“磁盘”可能不一致。
+- 单个会话文件达到 `maxLogFileBytes`（默认 64 MiB）后，**只把这个会话的旧 JSONL 清掉并从当前
+  记录重新写**，不会因为一个会话超限而删除其它会话的文件。当前内存记录、面板列表与 HTTP 路由
+  仍正常；此时“占用空间”（内存估算）与“磁盘”可能不一致，刷新页面后只能加载磁盘上保留的新记录。
+- **孤儿清理**：插件启动后约 1 秒扫描一次，之后默认每 60 秒扫描一次 `dataDir`，只处理文件名符合
+  会话 id 规则的 `*.jsonl`。会话在被扫描时如果既不在 live Session / `sessionPersistence` 中，
+  或已经进入 Workspace 归档集合，对应 JSONL 会被删除；父会话被归档/删除时，沿
+  `header.parentSession` 链派生的智能体团队/子代理日志也会一并清理。`README.txt`、
+  `unattributed.jsonl` 以及任何不认识的普通文件都不会被触碰。如果拿不到权威的会话列表，
+  本轮清理会安全跳过。
+- 归档会隐藏会话但不会删除 Session 本身；本插件的策略是在归档时一并清理对应 HTTP 抓包。
+  若之后取消归档，会话内容仍可恢复，但已清理的 HTTP 日志不会回来。
+- 每份文件按请求发起时的“当前 Agent / Session”归属。主 Agent 与它派生的智能体团队/子代理若使用
+  不同的 Session id，就会分别写入各自的 `<sessionId>.jsonl`，不会自动合并到父会话面板。
 
 ## 配置
 
@@ -239,7 +251,9 @@ rm -rf <本包目录>                                         # 如不再需要�
 | `redactSensitiveHeaders` | `true` | 把凭据类请求头的值替换为 `[redacted]`（如 `authorization`、`cookie`、`x-api-key`）。 |
 | `persist` | `true` | 是否把完成的记录追加写入 `dataDir` 下的 JSONL。 |
 | `dataDir` | `$DSH_HOME/session-http-log` | 记录保存目录（无 `DSH_HOME` 时回退到 `~/.dsh/session-http-log`）。 |
-| `maxLogFileBytes` | `67108864`（64 MiB） | 单个会话日志文件超过该大小时停止继续写入并只告警一次。 |
+| `maxLogFileBytes` | `67108864`（64 MiB） | **单会话**磁盘上限；达到上限时自动清理该会话旧 JSONL 并继续写新记录，不影响其它会话。 |
+| `cleanupOrphans` | `true` | 定时删除已归档/已删除会话及其派生子会话对应的孤儿 JSONL；读不到权威会话列表时会跳过。 |
+| `orphanSweepIntervalMs` | `60000`（60 秒） | 孤儿日志扫描间隔；插件启动后还会在约 1 秒时先扫一次。 |
 | `captureUnattributed` | `false` | 为 `true` 时，无法归属到会话的请求也会记录到 `unattributed` 桶。 |
 | `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择（macOS `open`、Windows `explorer.exe`、其它 `xdg-open`）。 |
 
@@ -277,6 +291,10 @@ Plugin Manager 中为“包名@版本 + 运行时版本”这一精确组合授�
 - HTTP 路由挂在 Harness 已鉴权的 Connection 通道上，只有拥有该 Host 的浏览器会话可读取。
 - 仅观测 `globalThis.fetch` 的流量；绕过 fetch 的传输（原生 socket、子进程、浏览器自身请求）
   不会被记录。
+- 智能体团队/子代理产生的流量会按发起请求时 `agents.currentInitiator().id` 归属；当前不把子会话
+  的 HTTP 记录聚合进父会话面板。
+- 归档/删除清理依赖 Harness 的 `sessionPersistence` 与 `workspaceRegistry.archivedSessionIds`；
+  如果这些服务不可用或读取失败，插件不会猜测性地删除文件。
 - 报文按配置上限抓取前缀，超限时取消抓取副本，**不会延迟或截断调用方自己的响应流**。
 - 观测器会串联此前已安装的 fetch 包装器（Developer tools 的 Inspector 也会包装 fetch），
   卸载时只还原自己那一层。

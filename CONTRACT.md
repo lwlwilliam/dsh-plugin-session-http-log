@@ -78,7 +78,9 @@ maxResponseBodyBytes: 4 * 1024 * 1024
 redactSensitiveHeaders: true
 persist: true
 dataDir: ''            // 默认：$DSH_HOME/session-http-log（回退 ~/.dsh/session-http-log）
-maxLogFileBytes: 64 * 1024 * 1024   // 超过后停止持久化并只告警一次
+maxLogFileBytes: 64 * 1024 * 1024   // 单会话磁盘上限；达到后只重置本会话 JSONL
+cleanupOrphans: true                // 定时删除已归档/已删除会话的孤儿 JSONL
+orphanSweepIntervalMs: 60 * 1000    // 孤儿扫描间隔；启动后约 1 秒先扫一次
 captureUnattributed: false          // 为 true 时，无 initiator 的请求记入 "unattributed"
 openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe / xdg-open）
 ```
@@ -124,9 +126,10 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
    'application/json; charset=utf-8', 'cache-control': 'no-store' } })`；错误返回 4xx/5xx
    JSON `{ error: string }`。`sessionId` 用 `/^[A-Za-z0-9._-]{1,200}$/` 校验。
    - `GET /api/dsh-plugin-session-http-log/records?sessionId=…&limit=…`
-     → `{ sessionId, total, totalBytes, fileBytes, dir, records: RecordSummary[] }`
-     （最新在后，summary 不含报文；`totalBytes` = 估算已存字节，`fileBytes` = JSONL 文件大小
-     或 null，`dir` = 持久化目录）
+     → `{ sessionId, total, totalBytes, fileBytes, dir, persist, maxLogFileBytes,
+     records: RecordSummary[] }`（最新在后，summary 不含报文；`totalBytes` = 估算已存字节，
+     `fileBytes` = JSONL 文件大小或 null，`dir` = 持久化目录，`persist` = 是否持久化，
+     `maxLogFileBytes` = 单会话磁盘上限）
    - `GET /api/dsh-plugin-session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404
    - `POST /api/dsh-plugin-session-http-log/clear` body `{ "sessionId": "…" }` → `{ ok: true, removed: n }`
    - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
@@ -190,6 +193,8 @@ window.__ModuleLoader__.load({
   `GET api/dsh-plugin-session-http-log/record?sessionId=…&id=…`；清空按钮 POST
   `api/dsh-plugin-session-http-log/clear`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
 - 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空、导出、打开目录）；
+  持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示
+  `maxLogFileBytes` 是单会话磁盘上限、达到后会清理本会话旧日志；不得暗示会清理其它会话。
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。
 - 行：方法 chip、路径（tooltip 为完整 URL）、按状态着色的状态 chip（2xx success、3xx idle、
@@ -212,7 +217,8 @@ window.__ModuleLoader__.load({
    `effect(cb)` 立即执行并保留 cleanup；对本地 `node:http` 服务器安装插件；调用
    `fetch(url, { method:'POST', body: JSON.stringify({model:'m'}), headers })`；断言抓到的记录
    含原始请求/响应文本、请求头、计时、`kind:'llm'`；断言 list/detail/clear/HAR/reveal 路由；
-   断言字节预算淘汰；dispose 后 `globalThis.fetch` 还原。
+   断言字节预算淘汰、单会话超 `maxLogFileBytes` 后旧文件被重置且能继续写、
+   未知/已归档会话的 JSONL 被孤儿清理且有效文件保留；dispose 后 `globalThis.fetch` 还原。
 3. Client 冒烟测试（`test/client-smoke.mjs`）：伪 React + 伪客户端上下文加载真实 `client.js`，
    断言 tab/pane 注册、en/zh 字典完整性、视图渲染、主题 token 使用。
 4. `plugin_manager install_bundle` 安装 bundle，再用 `cordis_inspect_query Config.listConfigs`

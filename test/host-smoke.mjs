@@ -12,7 +12,7 @@
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { strict as assert } from 'node:assert'
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const { apply } = await import(new URL('../index.js', import.meta.url).href)
@@ -22,6 +22,9 @@ let initiator = { id: 'session-test' }
 const routes = new Map()
 const cleanups = []
 const warnings = []
+let knownSessionIds = new Set(['session-test', 'session-evict', 'session-marker'])
+let sessionParents = new Map()
+const workspaceRegistry = { archivedSessionIds: [] }
 
 const connectionFace = {
   fetch: {
@@ -43,6 +46,20 @@ const fakeCtx = {
       }
     }
     if (name === 'connection') return connectionFace
+    if (name === 'sessionPersistence') {
+      return {
+        async list() {
+          return [...knownSessionIds].map((id) => ({
+            header: {
+              id,
+              ...(sessionParents.has(id) ? { parentSession: sessionParents.get(id) } : {}),
+            },
+          }))
+        },
+      }
+    }
+    if (name === 'workspaceRegistry') return workspaceRegistry
+    if (name === 'sessions') return { list: () => [] }
     return undefined
   },
   connection: connectionFace,
@@ -174,6 +191,8 @@ const feed = (await callRoute('/api/dsh-plugin-session-http-log/records', { quer
 assert.ok(feed.totalBytes > 0, 'session total stored bytes reported')
 assert.equal(feed.fileBytes, null, 'no persisted file size when persistence is off')
 assert.equal(feed.dir, dataDir, 'data directory reported')
+assert.equal(feed.persist, false, 'persistence flag reported')
+assert.equal(feed.maxLogFileBytes, 64 * 1024 * 1024, 'per-session disk cap reported')
 
 const detail = await callRoute('/api/dsh-plugin-session-http-log/record', {
   query: `?sessionId=session-test&id=${summary.id}`,
@@ -299,7 +318,76 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after marker run')
 assert.equal(routes.size, 0, 'routes removed after marker run')
 await rm(markerDir, { recursive: true, force: true })
 
+// 10. maxLogFileBytes rotates only the oversized session file.
+const trimDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-trim-'))
+knownSessionIds.add('session-trim')
+workspaceRegistry.archivedSessionIds = []
+const trimPath = join(trimDir, 'session-trim.jsonl')
+const sentinel = 'old-log-sentinel-' + 'x'.repeat(8192)
+await writeFile(trimPath, sentinel + '\n', 'utf8')
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: trimDir,
+  maxLogFileBytes: 4096,
+  orphanSweepIntervalMs: 60_000,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for trim run')
+initiator = { id: 'session-trim' }
+await (await globalThis.fetch(`${base}/json`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ q: 'trim' }),
+})).text()
+const trimmedText = await waitFor(async () => {
+  try {
+    const text = await readFile(trimPath, 'utf8')
+    return text.includes('trim') && !text.includes('old-log-sentinel-') ? text : null
+  } catch {
+    return null
+  }
+}, 'per-session log rotation')
+assert.ok(Buffer.byteLength(trimmedText, 'utf8') < Buffer.byteLength(sentinel, 'utf8'), 'old oversized file was replaced')
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after trim run')
+assert.equal(routes.size, 0, 'routes removed after trim run')
+await rm(trimDir, { recursive: true, force: true })
+
+// 11. orphan sweep removes unknown + archived session files, keeps valid ones.
+const orphanDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-orphan-'))
+knownSessionIds = new Set(['session-keep', 'session-archived', 'session-team-child'])
+sessionParents = new Map([['session-team-child', 'session-archived']])
+workspaceRegistry.archivedSessionIds = ['session-archived']
+for (const id of ['session-keep', 'session-archived', 'session-team-child', 'session-orphan', 'unattributed']) {
+  await writeFile(join(orphanDir, `${id}.jsonl`), '{}\n', 'utf8')
+}
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: orphanDir,
+  cleanupOrphans: true,
+  orphanSweepIntervalMs: 25,
+})
+await waitFor(async () => {
+  const missing = []
+  for (const id of ['session-archived', 'session-team-child', 'session-orphan']) {
+    try {
+      await access(join(orphanDir, `${id}.jsonl`))
+    } catch {
+      missing.push(id)
+    }
+  }
+  return missing.length === 3
+}, 'orphan sweep')
+await access(join(orphanDir, 'session-keep.jsonl'))
+await access(join(orphanDir, 'unattributed.jsonl'))
+assert.ok(true, 'orphan sweep keeps valid and unattributed capture files')
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after orphan run')
+assert.equal(routes.size, 0, 'routes removed after orphan run')
+await rm(orphanDir, { recursive: true, force: true })
+
 server.close()
 await once(server, 'close')
 await rm(dataDir, { recursive: true, force: true })
-console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, dispose)')
+console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, rotation, orphan cleanup, dispose)')
