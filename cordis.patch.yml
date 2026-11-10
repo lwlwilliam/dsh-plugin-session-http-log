@@ -1,0 +1,12 @@
+- insert:
+    - id: session-http-log
+      name: '@local/session-http-log'
+      config:
+        maxRequestsPerSession: 500
+        maxSessionBytes: 33554432
+        maxRequestBodyBytes: 2097152
+        maxResponseBodyBytes: 4194304
+        redactSensitiveHeaders: true
+        persist: true
+        dataDir: ''
+        openDirectoryCommand: ''

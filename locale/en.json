@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session HTTP log",
+    "description": "Records the raw HTTP requests and responses a session makes and shows them in the right Sidebar. Uninstalling the plugin does not delete the captured data directory."
+  }
+}

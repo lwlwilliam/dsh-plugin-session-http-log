@@ -1,0 +1,107 @@
+# 发布到 npmjs（可选）。默认不触发，只有推送 `v*` 标签（或手动运行）时才发布。
+#
+# 触发前必须完成的仓库配置（否则 preflight 会明确报错并停止）：
+#   1. package.json 去掉 `"private": true`。
+#   2. 把包名从占位的 `@local/session-http-log` 改成可发布的名称，例如
+#      `dsh-session-http-log`（当前 npm 上未被占用）或你自己的 scope `@you/...`。
+#   3. 在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加 `NPM_TOKEN`
+#      （npmjs 的 Granular Access Token，至少对该包有 read/write 权限）；
+#      或改用 npm 的 Trusted Publishing（OIDC），见 README 的说明。
+#   4. 建议补上 `"repository"` 字段（指向本 GitHub 仓库），这样 `--provenance` 才能生效。
+#
+# 发布：先改版本号（`npm version patch` 会自动打 tag），再 `git push --tags`。
+# 之后安装：dsh plugin --profile web add <包名>
+
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only run npm publish --dry-run (do not publish)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # OIDC：npm provenance / Trusted Publishing
+
+jobs:
+  publish:
+    name: Publish package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Preflight checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const pkg = require('./package.json')
+          const fail = (message) => {
+            console.error(`::error::${message}`)
+            process.exit(1)
+          }
+          if (pkg.private === true) {
+            fail('package.json still has "private": true — remove it before publishing to npm.')
+          }
+          if (typeof pkg.name !== 'string' || pkg.name.length === 0) {
+            fail('package.json has no "name".')
+          }
+          if (pkg.name.startsWith('@local/')) {
+            fail(`package name "${pkg.name}" is a local placeholder — rename it, e.g. "dsh-session-http-log" or "@your-scope/session-http-log".`)
+          }
+          if (pkg.name.startsWith('@') === false) {
+            console.log(`::notice::publishing unscoped package "${pkg.name}"`)
+          } else if (pkg.publishConfig?.access !== 'public') {
+            console.warn(`::warning::scoped package "${pkg.name}" without publishConfig.access="public" — the publish command below passes --access public, but the manifest is clearer with it.`)
+          }
+          if (pkg.repository === undefined) {
+            console.warn('::warning::no "repository" field — npm provenance will be skipped until you add it.')
+          }
+          NODE
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            version="$(node -p "require('./package.json').version")"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match package version ${version}"
+              exit 1
+            fi
+          fi
+
+      - name: Tests
+        run: |
+          node --check index.js
+          node --check client.js
+          node test/host-smoke.mjs
+          node test/client-smoke.mjs
+
+      - name: Publish
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--access public)
+          if node -e 'process.exit(require("./package.json").repository === undefined ? 1 : 0)'; then
+            args+=(--provenance)
+          else
+            echo "::warning::skipping --provenance (add a \"repository\" field pointing at this GitHub repo to enable it)"
+          fi
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            npm publish --dry-run "${args[@]}"
+          else
+            npm publish "${args[@]}"
+          fi

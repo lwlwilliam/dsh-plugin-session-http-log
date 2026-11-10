@@ -1,0 +1,131 @@
+# 每次提交：先跑冒烟测试，再为这次提交打包并发布一个 GitHub Release。
+#
+# - push 到 main / master：跑测试 → `npm pack` → 建 `build-<sha12>` release，附：
+#     session-http-log-<version>-<sha12>.tgz
+#     session-http-log-<version>-<sha12>.tgz.sha256
+#   同时把包上传为 workflow artifact，方便在 Actions 页面直接下载（不需要 Release 权限）。
+# - pull_request：只跑测试，不发布。
+# - 手动触发：Actions 页面 Run workflow（同样会发布当前提交对应的 release）。
+#
+# 安装 release 里的包：
+#   dsh plugin --profile web add <release 里 .tgz 的下载地址>
+# 也可以直接把仓库地址填进 Plugins 安装框（仓库根目录必须就是本插件包根目录）。
+#
+# 如果不想每个提交都产生 release，把 release job 的 `if:` 限制成 tags 触发即可，
+# 例如给 workflow 增加 `on.push.tags: ['v*']` 并改成 `if: startsWith(github.ref, 'refs/tags/')`。
+
+name: CI and per-commit package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+# `gh release create/upload` 需要写仓库 contents 的权限。
+permissions:
+  contents: write
+
+# 同一分支的并发 push 串行发布，避免两个 run 抢同一个 release tag。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+
+      - name: Smoke tests
+        run: |
+          node test/host-smoke.mjs
+          node test/client-smoke.mjs
+
+  release:
+    name: Release package for this commit
+    needs: check
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Pack the bundle
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          version="$(node -p "require('./package.json').version")"
+          asset="session-http-log-${version}-${short_sha}.tgz"
+
+          # `npm pack` 按 package.json 的 "files" 生成可安装的 tarball。
+          npm pack --silent > /dev/null
+          packed="$(ls -t ./*.tgz | head -n 1)"
+          mv "$packed" "$asset"
+
+          # 校验和随包一起发布，便于安装前核对。
+          sha256sum "$asset" > "${asset}.sha256"
+
+          {
+            echo "tag=build-${short_sha}"
+            echo "asset=${asset}"
+            echo "sha=${short_sha}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ steps.pack.outputs.tag }}'
+          asset='${{ steps.pack.outputs.asset }}'
+          version='${{ steps.pack.outputs.version }}'
+          sha='${{ steps.pack.outputs.sha }}'
+
+          notes="Automated package for commit ${GITHUB_SHA}.
+
+          Install: \`dsh plugin --profile web add <download URL of ${asset}>\`
+          Version: ${version}
+          Commit: ${GITHUB_SHA}"
+
+          # 重跑同一提交时（workflow_dispatch 或重试），复用已有 release 并覆盖资产。
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "$asset" "${asset}.sha256" --clobber
+          else
+            gh release create "$tag" "$asset" "${asset}.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "Build ${sha}" \
+              --notes "$notes"
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-http-log-${{ steps.pack.outputs.sha }}
+          path: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.asset }}.sha256
+          if-no-files-found: error
