@@ -1,8 +1,8 @@
 # 每次提交：先跑冒烟测试，再为这次提交打包并发布一个 GitHub Release。
 #
 # - push 到 main / master：跑测试 → `npm pack` → 建 `build-<sha12>` release，附：
-#     session-http-log-<version>-<sha12>.tgz
-#     session-http-log-<version>-<sha12>.tgz.sha256
+#     dsh-plugin-session-http-log-<version>-<sha12>.tgz
+#     dsh-plugin-session-http-log-<version>-<sha12>.tgz.sha256
 #   同时把包上传为 workflow artifact，方便在 Actions 页面直接下载（不需要 Release 权限）。
 # - pull_request：只跑测试，不发布。
 # - 手动触发：Actions 页面 Run workflow（同样会发布当前提交对应的 release）。
@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
           version="$(node -p "require('./package.json').version")"
-          asset="session-http-log-${version}-${short_sha}.tgz"
+          asset="dsh-plugin-session-http-log-${version}-${short_sha}.tgz"
 
           # `npm pack` 按 package.json 的 "files" 生成可安装的 tarball。
           npm pack --silent > /dev/null
@@ -124,7 +124,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: session-http-log-${{ steps.pack.outputs.sha }}
+          name: dsh-plugin-session-http-log-${{ steps.pack.outputs.sha }}
           path: |
             ${{ steps.pack.outputs.asset }}
             ${{ steps.pack.outputs.asset }}.sha256

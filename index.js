@@ -4,20 +4,21 @@
  * 包装 `globalThis.fetch`，抓取会话产生的原始 HTTP 线上流量
  * （LLM API 调用、网页搜索/抓取、MCP HTTP 等），把每次交换归属到
  * 发起它的会话，按会话保留一份有上限的内存日志，并按配置
- * 以 JSONL 追加到 `$DSH_HOME/session-http-log`，同时提供五个
- * 经过身份校验的 `/api/session-http-log/*` 路由供客户端面板读取。
+ * 以 JSONL 追加到 `$DSH_HOME/session-http-log`（目录名保持稳定，不随
+ * 插件改名迁移，以免已有抓包数据在面板中消失），同时提供五个
+ * 经过身份校验的 `/api/dsh-plugin-session-http-log/*` 路由供客户端面板读取。
  *
  * 本模块必须保持自包含：从已安装的 bundle 位置只能解析 Node 内置模块，
  * 因此这里不得出现任何 `@deepseek-ai/*` 导入。
  *
  * 路由（全部经过身份校验，仅属主浏览器可达）：
- *   GET  /api/session-http-log/records?sessionId&limit  → 概要 + 总量，最新在最后
- *   GET  /api/session-http-log/record?sessionId&id      → 单条完整记录
- *   POST /api/session-http-log/clear                    → { ok, removed }
- *   GET  /api/session-http-log/har?sessionId            → HAR 1.2 归档
- *   POST /api/session-http-log/reveal                   → { ok, dir }（打开数据目录）
+ *   GET  /api/dsh-plugin-session-http-log/records?sessionId&limit  → 概要 + 总量，最新在最后
+ *   GET  /api/dsh-plugin-session-http-log/record?sessionId&id      → 单条完整记录
+ *   POST /api/dsh-plugin-session-http-log/clear                    → { ok, removed }
+ *   GET  /api/dsh-plugin-session-http-log/har?sessionId            → HAR 1.2 归档
+ *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir }（打开数据目录）
  *
- * @module @local/session-http-log
+ * @module @local/dsh-plugin-session-http-log
  */
 
 import { spawn } from 'node:child_process'
@@ -38,11 +39,11 @@ const DEFAULT_MAX_LOG_FILE_BYTES = 64 * 1024 * 1024
 
 /** 提供给属主浏览器的精确 fetch 路由。 */
 const ROUTE_PATHS = Object.freeze({
-  records: '/api/session-http-log/records',
-  record: '/api/session-http-log/record',
-  clear: '/api/session-http-log/clear',
-  har: '/api/session-http-log/har',
-  reveal: '/api/session-http-log/reveal',
+  records: '/api/dsh-plugin-session-http-log/records',
+  record: '/api/dsh-plugin-session-http-log/record',
+  clear: '/api/dsh-plugin-session-http-log/clear',
+  har: '/api/dsh-plugin-session-http-log/har',
+  reveal: '/api/dsh-plugin-session-http-log/reveal',
 })
 
 /** 监视一次 reveal 派生的 spawn 异步 `error` 多久后按成功上报。 */
@@ -58,10 +59,10 @@ const JSON_RESPONSE_HEADERS = Object.freeze({
 const HAR_RESPONSE_HEADERS = Object.freeze({
   'content-type': 'application/json',
   'cache-control': 'no-store',
-  'content-disposition': 'attachment; filename="session-http-log.har"',
+  'content-disposition': 'attachment; filename="dsh-plugin-session-http-log.har"',
 })
 
-const HAR_CREATOR = Object.freeze({ name: 'session-http-log', version: '0.1.0' })
+const HAR_CREATOR = Object.freeze({ name: 'dsh-plugin-session-http-log', version: '0.1.0' })
 
 /** 浏览器接受的会话 id；同时保证文件名可预测。 */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/
@@ -90,7 +91,11 @@ const KIND_PATH_PATTERN = /\/(chat\/completions|completions|messages|responses|e
 /** 以 UTF-8 文本而非 base64 存储的内容类型。 */
 const TEXTUAL_CONTENT_TYPE_PATTERN = /(json|xml|javascript|ecmascript|graphql|event-stream|www-form-urlencoded)/
 
-/** `$DSH_HOME` 下的持久化目录名。 */
+/**
+ * `$DSH_HOME` 下的持久化目录名。
+ * 刻意保持为 `session-http-log`：目录名是磁盘数据兼容标识，插件改名后
+ * 不迁移、不改名，避免已有抓包数据在面板中凭空消失。
+ */
 const DATA_DIR_NAME = 'session-http-log'
 
 /** 数据目录内说明文件的文件名；仅在缺失时创建，绝不覆盖。 */
@@ -98,10 +103,10 @@ const DATA_DIR_MARKER_NAME = 'README.txt'
 
 /** 数据目录说明文件的内容：提示数据来源、卸载后留存以及安全删除方式。 */
 const DATA_DIR_MARKER_CONTENT = [
-  '会话 HTTP 记录（@local/session-http-log）数据目录',
+  '会话 HTTP 记录（@local/dsh-plugin-session-http-log）数据目录',
   '================================================',
   '',
-  '本目录保存 @local/session-http-log 插件抓取的各会话原始 HTTP 报文，',
+  '本目录保存 @local/dsh-plugin-session-http-log 插件抓取的各会话原始 HTTP 报文，',
   '每个会话对应一个 <sessionId>.jsonl 文件，每行一条 JSON 记录。',
   '',
   '- 卸载插件不会删除本目录，其中的记录会一直保留到手动清理。',
@@ -109,13 +114,16 @@ const DATA_DIR_MARKER_CONTENT = [
   '- 单个会话文件的写入达到 maxLogFileBytes（默认 64 MiB）后会停止。',
   '- 凭据类请求头（authorization、cookie、api-key 等）默认已脱敏为 [redacted]。',
   '- 清理某个会话只会删除对应的 jsonl 文件，本说明文件会保留。',
+  '- 目录名沿用 session-http-log：插件改名不会迁移本目录，以免已有数据丢失。',
   '',
   'This directory holds the raw HTTP capture files of the',
-  '@local/session-http-log plugin, one <sessionId>.jsonl per session.',
+  '@local/dsh-plugin-session-http-log plugin, one <sessionId>.jsonl per session.',
   'Uninstalling the plugin does NOT delete them, and the directory is',
   'safe to delete wholesale once the captures are no longer needed.',
   'Per-session writes stop at maxLogFileBytes (default 64 MiB), and',
   'credential headers are redacted by default.',
+  'The directory name stays "session-http-log" so a plugin rename never',
+  'orphans existing captures.',
   '',
 ].join('\n')
 
@@ -155,9 +163,9 @@ export const inject = ['connection']
  */
 export function apply(ctx, config = {}) {
   const runtime = createRuntime(ctx, resolveConfig(config))
-  ctx.effect(() => runtime.install(), 'session-http-log: fetch observer')
+  ctx.effect(() => runtime.install(), 'dsh-plugin-session-http-log: fetch observer')
   for (const route of runtime.routes) {
-    ctx.effect(() => runtime.registerRoute(route), `session-http-log: ${route.path}`)
+    ctx.effect(() => runtime.registerRoute(route), `dsh-plugin-session-http-log: ${route.path}`)
   }
   // 说明文件是尽力而为的副产物：不 await，失败只记日志，绝不影响激活。
   runtime.writeDirectoryMarker()
@@ -288,7 +296,7 @@ function createRuntime(ctx, config) {
       if (oldest.done !== true) reportedErrors.delete(oldest.value)
     }
     try {
-      ctx.logger?.warn?.(`[session-http-log] ${key}`)
+      ctx.logger?.warn?.(`[dsh-plugin-session-http-log] ${key}`)
     } catch {
       /* 记录日志是尽力而为 */
     }
@@ -1312,7 +1320,7 @@ async function captureBody(body, limit, signal, onProgress) {
       const remaining = limit - bytes
       if (remaining <= 0) {
         truncated = true
-        cancel('session-http-log: body capture limit reached')
+        cancel('dsh-plugin-session-http-log: body capture limit reached')
         break
       }
       const take = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk
@@ -1320,7 +1328,7 @@ async function captureBody(body, limit, signal, onProgress) {
       bytes += take.byteLength
       if (take.byteLength < chunk.byteLength) {
         truncated = true
-        cancel('session-http-log: body capture limit reached')
+        cancel('dsh-plugin-session-http-log: body capture limit reached')
         break
       }
       if (onProgress !== undefined) {

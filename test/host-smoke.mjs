@@ -1,5 +1,5 @@
 /**
- * Lead-owned Host smoke test for the session-http-log bundle.
+ * Lead-owned Host smoke test for the dsh-plugin-session-http-log bundle.
  *
  * Runs the real `index.js` plugin against a fake Cordis context and a local
  * node:http server, then asserts the raw-capture behavior and the four
@@ -64,7 +64,7 @@ const fakeCtx = {
   },
 }
 
-const dataDir = await mkdtemp(join(tmpdir(), 'session-http-log-smoke-'))
+const dataDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-smoke-'))
 const config = {
   maxRequestsPerSession: 20,
   maxRequestBodyBytes: 64 * 1024,
@@ -158,7 +158,7 @@ const streamed = await response.text()
 assert.ok(streamed.includes('[DONE]'), 'caller still receives the stream')
 
 const summary = await waitFor(async () => {
-  const result = await callRoute('/api/session-http-log/records', {
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', {
     query: '?sessionId=session-test',
   })
   return result.json.records.find((record) => record.status === 200 && record.kind === 'llm')
@@ -170,12 +170,12 @@ assert.equal(summary.sessionId, 'session-test')
 assert.ok(summary.durationMs >= 0, 'headers duration recorded')
 assert.ok(summary.responseBytes > 0, 'response bytes recorded')
 
-const feed = (await callRoute('/api/session-http-log/records', { query: '?sessionId=session-test' })).json
+const feed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })).json
 assert.ok(feed.totalBytes > 0, 'session total stored bytes reported')
 assert.equal(feed.fileBytes, null, 'no persisted file size when persistence is off')
 assert.equal(feed.dir, dataDir, 'data directory reported')
 
-const detail = await callRoute('/api/session-http-log/record', {
+const detail = await callRoute('/api/dsh-plugin-session-http-log/record', {
   query: `?sessionId=session-test&id=${summary.id}`,
 })
 const record = detail.json.record
@@ -197,14 +197,14 @@ await (await globalThis.fetch(`${base}/json`, {
 })).text()
 await (await globalThis.fetch(`${base}/binary`)).arrayBuffer()
 await waitFor(async () => {
-  const result = await callRoute('/api/session-http-log/records', { query: '?sessionId=session-test' })
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })
   return result.json.records.length >= 3
 }, 'all exchanges captured')
 
-const all = (await callRoute('/api/session-http-log/records', { query: '?sessionId=session-test&limit=10' })).json
+const all = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test&limit=10' })).json
 assert.equal(all.total, 3)
 const binarySummary = all.records.find((item) => item.url.endsWith('/binary'))
-const binaryDetail = (await callRoute('/api/session-http-log/record', {
+const binaryDetail = (await callRoute('/api/dsh-plugin-session-http-log/record', {
   query: `?sessionId=session-test&id=${binarySummary.id}`,
 })).json.record
 assert.equal(binaryDetail.responseBodyEncoding, 'base64', 'binary body stored as base64')
@@ -214,10 +214,10 @@ assert.equal(Buffer.from(binaryDetail.responseBody, 'base64').toString('hex'), '
 initiator = undefined
 await (await globalThis.fetch(`${base}/json`)).text()
 await sleep(150)
-assert.equal((await callRoute('/api/session-http-log/records', { query: '?sessionId=session-test' })).json.total, 3)
+assert.equal((await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })).json.total, 3)
 
 // 4. HAR export shape.
-const har = (await callRoute('/api/session-http-log/har', { query: '?sessionId=session-test' })).json
+const har = (await callRoute('/api/dsh-plugin-session-http-log/har', { query: '?sessionId=session-test' })).json
 assert.equal(har.log.version, '1.2')
 assert.equal(har.log.entries.length, 3)
 const entry = har.log.entries[0]
@@ -227,22 +227,22 @@ assert.ok(entry.response.content.mimeType.length > 0)
 assert.equal(typeof entry.timings.wait, 'number')
 
 // 5. bad session id rejected.
-assert.ok((await callRoute('/api/session-http-log/records', { query: '?sessionId=../etc/passwd' })).status >= 400)
+assert.ok((await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=../etc/passwd' })).status >= 400)
 
 // 5b. reveal the persisted-records directory (command overridden to `true` in the test).
-const revealed = await callRoute('/api/session-http-log/reveal', { method: 'POST' })
+const revealed = await callRoute('/api/dsh-plugin-session-http-log/reveal', { method: 'POST' })
 assert.equal(revealed.status, 200)
 assert.equal(revealed.json.ok, true)
 assert.equal(revealed.json.dir, dataDir)
 
 // 6. clear.
-const cleared = await callRoute('/api/session-http-log/clear', {
+const cleared = await callRoute('/api/dsh-plugin-session-http-log/clear', {
   method: 'POST',
   body: { sessionId: 'session-test' },
 })
 assert.equal(cleared.json.ok, true)
 assert.ok(cleared.json.removed >= 3)
-assert.equal((await callRoute('/api/session-http-log/records', { query: '?sessionId=session-test' })).json.total, 0)
+assert.equal((await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })).json.total, 0)
 
 // 7. dispose restores fetch and removes routes.
 for (const cleanup of cleanups.splice(0)) cleanup()
@@ -262,7 +262,7 @@ for (let index = 0; index < 3; index += 1) {
   })).text()
 }
 const evictFeed = await waitFor(async () => {
-  const result = await callRoute('/api/session-http-log/records', { query: '?sessionId=session-evict' })
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-evict' })
   return result.json.records.some((item) => item.id === 3) ? result.json : null
 }, 'eviction session captured')
 assert.ok(evictFeed.total <= 2, `byte budget evicts oldest records (kept ${evictFeed.total})`)
@@ -275,7 +275,7 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after eviction run
 assert.equal(routes.size, 0, 'routes removed after eviction run')
 
 // 9. persistence marker: a persist-enabled run explains the data directory.
-const markerDir = await mkdtemp(join(tmpdir(), 'session-http-log-marker-'))
+const markerDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-marker-'))
 apply(fakeCtx, { ...config, persist: true, dataDir: markerDir })
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for marker run')
 const markerPath = join(markerDir, 'README.txt')
@@ -288,9 +288,9 @@ await waitFor(async () => {
   }
 }, 'data-directory marker')
 const markerText = await readFile(markerPath, 'utf8')
-assert.ok(markerText.includes('@local/session-http-log'), 'marker names the plugin')
+assert.ok(markerText.includes('@local/dsh-plugin-session-http-log'), 'marker names the plugin')
 assert.ok(/uninstall|卸载/i.test(markerText), 'marker explains that uninstalling keeps the data')
-await callRoute('/api/session-http-log/clear', { method: 'POST', body: { sessionId: 'session-marker' } })
+await callRoute('/api/dsh-plugin-session-http-log/clear', { method: 'POST', body: { sessionId: 'session-marker' } })
 await access(markerPath)
 assert.ok(true, 'clearing a session keeps the marker')
 
@@ -302,4 +302,4 @@ await rm(markerDir, { recursive: true, force: true })
 server.close()
 await once(server, 'close')
 await rm(dataDir, { recursive: true, force: true })
-console.log('PASS session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, dispose)')
+console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, dispose)')

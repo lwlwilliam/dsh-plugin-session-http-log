@@ -2,8 +2,8 @@
 #
 # 触发前必须完成的仓库配置（否则 preflight 会明确报错并停止）：
 #   1. package.json 去掉 `"private": true`。
-#   2. 把包名从占位的 `@local/session-http-log` 改成可发布的名称，例如
-#      `dsh-session-http-log`（当前 npm 上未被占用）或你自己的 scope `@you/...`。
+#   2. 把包名从占位的 `@local/dsh-plugin-session-http-log` 改成可发布的名称，例如
+#      `dsh-plugin-session-http-log`（当前 npm 上未被占用）或你自己的 scope `@you/dsh-plugin-session-http-log`。
 #   3. 在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加 `NPM_TOKEN`
 #      （npmjs 的 Granular Access Token，至少对该包有 read/write 权限）；
 #      或改用 npm 的 Trusted Publishing（OIDC），见 README 的说明。
@@ -60,7 +60,7 @@ jobs:
             fail('package.json has no "name".')
           }
           if (pkg.name.startsWith('@local/')) {
-            fail(`package name "${pkg.name}" is a local placeholder — rename it, e.g. "dsh-session-http-log" or "@your-scope/session-http-log".`)
+            fail(`package name "${pkg.name}" is a local placeholder — rename it, e.g. "dsh-plugin-session-http-log" or "@your-scope/dsh-plugin-session-http-log".`)
           }
           if (pkg.name.startsWith('@') === false) {
             console.log(`::notice::publishing unscoped package "${pkg.name}"`)

@@ -1,17 +1,17 @@
 window.__ModuleLoader__.load({
-  id: '@local/session-http-log',
+  id: '@local/dsh-plugin-session-http-log',
   factory(require) {
     const React = require('react')
     const h = React.createElement
 
     /** Tab 类型标识：与模块加载器 id 及 dsh.client 条目名一致。 */
-    const PLUGIN_ID = '@local/session-http-log'
+    const PLUGIN_ID = '@local/dsh-plugin-session-http-log'
     /** 本面板所有可见文案所属的 locale 命名空间。 */
-    const NS = 'session-http-log'
+    const NS = 'dsh-plugin-session-http-log'
     /** 右侧边栏的 Tab 类型判别值。 */
-    const KIND = 'session-http-log'
+    const KIND = 'dsh-plugin-session-http-log'
     /** Host 路由的文档相对前缀（无前导斜杠：挂载路径不属于本插件）。 */
-    const ROUTE = 'api/session-http-log'
+    const ROUTE = 'api/dsh-plugin-session-http-log'
     /** 面板挂载且自动刷新开启时的列表刷新间隔。 */
     const POLL_INTERVAL_MS = 1200
     /** 服务端列表上限；面板不会请求更多。 */
@@ -19,11 +19,11 @@ window.__ModuleLoader__.load({
     /** 复制按钮保留“已复制”/“复制失败”反馈的时长。 */
     const COPY_FEEDBACK_MS = 1600
     /** HAR 导出按钮提供的下载文件名。 */
-    const HAR_FILENAME = 'session-http-log.har'
+    const HAR_FILENAME = 'dsh-plugin-session-http-log.har'
     /** 超过该大小的报文仅显示原始内容：格式化会卡住面板。 */
     const MAX_PRETTY_CHARS = 1024 * 1024
     /** 本面板语言覆盖的 localStorage 键。 */
-    const LANG_STORAGE_KEY = 'session-http-log:lang'
+    const LANG_STORAGE_KEY = 'dsh-plugin-session-http-log:lang'
     /** 定位时列表行闪烁提示的时长。 */
     const FLASH_MS = 600
 
@@ -1366,7 +1366,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         const t = ctx.locale.bind(NS)
 
-        ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'session-http-log: dictionaries')
+        ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'dsh-plugin-session-http-log: dictionaries')
 
         ctx.effect(() => ctx.sidebarRightTabs.register({
           id: PLUGIN_ID,
@@ -1379,7 +1379,7 @@ window.__ModuleLoader__.load({
             title: () => t('tab.title'),
             description: () => t('tab.description'),
           }],
-        }), 'session-http-log: sidebar tab')
+        }), 'dsh-plugin-session-http-log: sidebar tab')
 
         const View = createView(ctx, 'panel')
         ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
@@ -1393,7 +1393,7 @@ window.__ModuleLoader__.load({
         const PageView = createView(ctx, 'page')
         ctx.slots.inject('conversation.view', () => ctx.slots.register({
           name: 'conversation.view',
-          id: 'session-http-log',
+          id: KIND,
           order: 50,
           locale: NS,
           label: () => t('view.tab'),

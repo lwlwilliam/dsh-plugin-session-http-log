@@ -1,5 +1,5 @@
 {
-  "name": "@local/session-http-log",
+  "name": "@local/dsh-plugin-session-http-log",
   "version": "0.1.0",
   "private": true,
   "type": "module",

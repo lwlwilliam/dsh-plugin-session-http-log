@@ -1,5 +1,5 @@
 /**
- * Lead-owned Client smoke test for the session-http-log bundle.
+ * Lead-owned Client smoke test for the dsh-plugin-session-http-log bundle.
  *
  * Loads the real `client.js` bundle factory in Node against a tiny React stub
  * and a fake Client context, then asserts the tab/pane registration and that
@@ -63,7 +63,7 @@ globalThis.fetch = async () => {
 
 await import(new URL('../client.js', import.meta.url).href)
 
-assert.equal(loadedId, '@local/session-http-log', 'module-loader id')
+assert.equal(loadedId, '@local/dsh-plugin-session-http-log', 'module-loader id')
 assert.ok(plugin !== null && typeof plugin.apply === 'function', 'factory returns a plugin')
 assert.deepEqual(plugin.inject, ['slots', 'locale', 'sidebarRightTabs'], 'service dependencies')
 
@@ -116,11 +116,11 @@ const ctx = {
 }
 
 plugin.apply(ctx)
-const t = fanout('session-http-log')
+const t = fanout('dsh-plugin-session-http-log')
 
 // ── registration assertions ─────────────────────────────────────────────────
 assert.equal(locales.length, 1, 'one locale namespace registered')
-assert.equal(locales[0].namespace, 'session-http-log')
+assert.equal(locales[0].namespace, 'dsh-plugin-session-http-log')
 assert.equal(typeof locales[0].dicts.en, 'object')
 assert.equal(typeof locales[0].dicts.zh, 'object')
 const enKeys = Object.keys(locales[0].dicts.en)
@@ -130,8 +130,8 @@ assert.deepEqual(zhKeys.sort(), enKeys.sort(), 'zh dictionary is complete')
 
 assert.equal(tabs.length, 1, 'one right-Sidebar tab type registered')
 const tab = tabs[0]
-assert.equal(tab.id, '@local/session-http-log')
-assert.equal(tab.kind, 'session-http-log')
+assert.equal(tab.id, '@local/dsh-plugin-session-http-log')
+assert.equal(tab.kind, 'dsh-plugin-session-http-log')
 assert.equal(tab.keepMounted, true)
 assert.equal(typeof tab.title, 'function')
 assert.equal(tab.guide.length, 1)
@@ -143,17 +143,17 @@ assert.deepEqual(slotInjects.slice().sort(), ['conversation.view', 'sidebar.righ
 assert.equal(slots.length, 2, 'right-Sidebar body and main-view tab registered')
 const slot = slots.find((entry) => entry.options.name === 'sidebar.right.pane.tab')
 assert.ok(slot, 'right-Sidebar pane body registered')
-assert.equal(slot.options.key, '@local/session-http-log', 'slot key equals the tab type id')
-assert.equal(slot.options.locale, 'session-http-log')
+assert.equal(slot.options.key, '@local/dsh-plugin-session-http-log', 'slot key equals the tab type id')
+assert.equal(slot.options.locale, 'dsh-plugin-session-http-log')
 assert.equal(typeof slot.options.inject, 'function')
 assert.deepEqual(slot.options.inject({ sessionId: 'session-abc' }), { sessionId: 'session-abc' })
 
 const view = slots.find((entry) => entry.options.name === 'conversation.view')
 assert.ok(view, 'main conversation-view tab registered')
-assert.equal(view.options.id, 'session-http-log')
+assert.equal(view.options.id, 'dsh-plugin-session-http-log')
 assert.equal(view.options.order, 50)
 assert.equal(typeof view.options.label, 'function')
-assert.equal(view.options.label(), 'session-http-log:view.tab')
+assert.equal(view.options.label(), 'dsh-plugin-session-http-log:view.tab')
 const mainProps = view.options.inject({ sessionId: 'session-abc' })
 assert.deepEqual(mainProps.sessionId, 'session-abc')
 assert.equal(mainProps.variant, 'page')
@@ -182,4 +182,4 @@ assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(css), 'no literal hex colors in the styles
 
 for (const cleanup of cleanups.splice(0)) cleanup()
 for (const timer of timers.splice(0)) clearTimeout(timer)
-console.log('PASS session-http-log client smoke test (registration, dictionaries, view render, theme tokens)')
+console.log('PASS dsh-plugin-session-http-log client smoke test (registration, dictionaries, view render, theme tokens)')

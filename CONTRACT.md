@@ -7,7 +7,9 @@
 （`node:fs`、`node:path`、`node:os`），`client.js` 只用 `require('react')`
 （必要时 `require('react/jsx-runtime')`，用 `React.createElement`，无 JSX、无构建步骤）。
 
-包目录：`<本包目录>`
+包目录：本仓库根目录（即 `package.json` 所在目录；下文 `<本包目录>` 均指它）。
+包名：`@local/dsh-plugin-session-http-log`；bundle patch 行 id：`dsh-plugin-session-http-log`。
+数据目录名保持 `session-http-log`（兼容已有抓包数据，不随插件改名迁移）。
 
 文件归属（不要改别人的文件）：
 
@@ -33,7 +35,7 @@
   `route = { path: '/api/...', methods: ['GET'|'HEAD'|'POST'], requestBody: 'buffered',
   fetch: (request: Request) => Promise<Response> }`。路由带鉴权，只有宿主所属浏览器可访问。
   浏览器端用**文档相对 URL** 调用：
-  `fetch('api/session-http-log/records?...', { credentials: 'same-origin' })`
+  `fetch('api/dsh-plugin-session-http-log/records?...', { credentials: 'same-origin' })`
   （注意没有前导斜杠；不要自行拼接挂载前缀）。
 - 右侧边栏 tab 的注册方式（照抄；参考实现：
   `node_modules/@deepseek-ai/dsh-experimental-session-inspector/lib/client.js`
@@ -51,7 +53,7 @@
     inject: (sessionId) => ({ sessionId }),
   }, View))
   ```
-  `PLUGIN_ID = '@local/session-http-log'`，必须与模块加载器 factory id、`dsh.client` 名称一致。
+  `PLUGIN_ID = '@local/dsh-plugin-session-http-log'`，必须与模块加载器 factory id、`dsh.client` 名称一致。
   插件对象返回 `{ inject: ['slots','locale','sidebarRightTabs'], apply(ctx) { … } }`；
   `View` 的 props 至少保证有 `props.sessionId`。
 - 可用主题 token：`--dsw-alias-bg-base`、`-bg-layer-1`、`-bg-layer-2`、`-bg-overlay`、
@@ -121,18 +123,18 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
    所有响应都是 `new Response(JSON.stringify(x), { headers: { 'content-type':
    'application/json; charset=utf-8', 'cache-control': 'no-store' } })`；错误返回 4xx/5xx
    JSON `{ error: string }`。`sessionId` 用 `/^[A-Za-z0-9._-]{1,200}$/` 校验。
-   - `GET /api/session-http-log/records?sessionId=…&limit=…`
+   - `GET /api/dsh-plugin-session-http-log/records?sessionId=…&limit=…`
      → `{ sessionId, total, totalBytes, fileBytes, dir, records: RecordSummary[] }`
      （最新在后，summary 不含报文；`totalBytes` = 估算已存字节，`fileBytes` = JSONL 文件大小
      或 null，`dir` = 持久化目录）
-   - `GET /api/session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404
-   - `POST /api/session-http-log/clear` body `{ "sessionId": "…" }` → `{ ok: true, removed: n }`
-   - `POST /api/session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
+   - `GET /api/dsh-plugin-session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404
+   - `POST /api/dsh-plugin-session-http-log/clear` body `{ "sessionId": "…" }` → `{ ok: true, removed: n }`
+   - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
      目录（平台默认或 `openDirectoryCommand`）；失败返回 500 `{ error }`。
-   - `GET /api/session-http-log/har?sessionId=…` → HAR 1.2 对象
-     `{ log: { version: '1.2', creator: { name: 'session-http-log', version: '0.1.0' },
+   - `GET /api/dsh-plugin-session-http-log/har?sessionId=…` → HAR 1.2 对象
+     `{ log: { version: '1.2', creator: { name: 'dsh-plugin-session-http-log', version: '0.1.0' },
      entries: [ … ] } }`；`content-type: application/json`，`content-disposition:
-     attachment; filename="session-http-log.har"`。HAR entry：`startedDateTime` ISO、
+     attachment; filename="dsh-plugin-session-http-log.har"`。HAR entry：`startedDateTime` ISO、
      `time` = 总毫秒、`request` { method, url, httpVersion: 'HTTP/1.1', headers: [{name,value}],
      queryString: [], cookies: [], headersSize: -1, bodySize, postData? { mimeType, text,
      …(base64 body: { encoding: 'base64' }) } }、`response` { status, statusText,
@@ -168,7 +170,7 @@ Record（详情）在其基础上增加：
 
 ```js
 window.__ModuleLoader__.load({
-  id: '@local/session-http-log',
+  id: '@local/dsh-plugin-session-http-log',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -179,14 +181,14 @@ window.__ModuleLoader__.load({
 ```
 
 要求：
-- 在命名空间 `session-http-log` 下注册 `en` 与 `zh` 字典，所有可见文案都通过
+- 在命名空间 `dsh-plugin-session-http-log` 下注册 `en` 与 `zh` 字典，所有可见文案都通过
   `ctx.locale.bind(NS)`（用户语言是中文，`zh` 必须完整）；面板内另有中/EN 快捷切换（见下）。
 - 按契约中的片段注册 tab 类型与面板 body；`keepMounted: true`。
 - 数据流：`props.sessionId`；挂载期间每约 1.2 秒轮询
-  `GET api/session-http-log/records?sessionId=…&limit=500`（`credentials: 'same-origin'`，
+  `GET api/dsh-plugin-session-http-log/records?sessionId=…&limit=500`（`credentials: 'same-origin'`，
   跳过重叠请求，卸载时 abort）；刷新按钮；选中时取详情
-  `GET api/session-http-log/record?sessionId=…&id=…`；清空按钮 POST
-  `api/session-http-log/clear`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
+  `GET api/dsh-plugin-session-http-log/record?sessionId=…&id=…`；清空按钮 POST
+  `api/dsh-plugin-session-http-log/clear`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
 - 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空、导出、打开目录）；
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。

@@ -40,15 +40,14 @@ Harness 的 initiator 链归属到对应会话。
 本插件是一个包含 Host 半与 Client 半的 bundle。推荐通过 **Plugins（插件）页面** 安装：
 
 1. 打开侧边栏的 **Plugins** 页面（或设置中的插件管理）。
-2. 选择安装/添加，目标是**本地包目录**（例如把本包放在
-   `<本包目录>` 后选择该目录），或一个 registry
+2. 选择安装/添加，目标是**本地包目录**（即本仓库根目录、`package.json` 所在目录），或一个 registry
    包规范（如果发布到 registry）。
 3. 安装完成后刷新一次 Web GUI 页面；右侧边栏 guide 中会出现 **会话 HTTP 记录**。
 
 命令行等价方式（`npx`/全局安装的 `dsh`、以及项目内 CLI 均可）：
 
 ```bash
-dsh plugin --profile web add <本包目录>
+dsh plugin --profile web add <本包目录绝对路径>
 # 或安装 registry 包：dsh plugin --profile web add <package-name>
 ```
 
@@ -71,18 +70,18 @@ git、不需要任何构建脚本、可以校验 sha256，因此本仓库自带�
 每次 push 到 `main` / `master` 会创建 tag `build-<提交短 SHA>` 的 Release，附：
 
 ```
-session-http-log-<version>-<短SHA>.tgz
-session-http-log-<version>-<短SHA>.tgz.sha256
+dsh-plugin-session-http-log-<version>-<短SHA>.tgz
+dsh-plugin-session-http-log-<version>-<短SHA>.tgz.sha256
 ```
 
 在 Plugins 的安装框填入该 Release 资产的下载地址，或命令行：
 
 ```bash
 dsh plugin --profile web add \
-  https://github.com/<owner>/<repo>/releases/download/build-<短SHA>/session-http-log-0.1.0-<短SHA>.tgz
+  https://github.com/<owner>/<repo>/releases/download/build-<短SHA>/dsh-plugin-session-http-log-0.1.0-<短SHA>.tgz
 ```
 
-安装前可核对：`sha256sum -c session-http-log-0.1.0-<短SHA>.tgz.sha256`。
+安装前可核对：`sha256sum -c dsh-plugin-session-http-log-0.1.0-<短SHA>.tgz.sha256`。
 
 **方式 B：GitHub 仓库地址**
 
@@ -117,7 +116,7 @@ dsh plugin --profile web add https://github.com/<owner>/<repo>
 
 | 字段 | 当前值 | 发布前 |
 |---|---|---|
-| `name` | `@local/session-http-log` | `@local` 是本地占位 scope，不能发布。改成未被占用的名字，例如 `dsh-session-http-log`（查询 npm registry 时可用），或你自己的 scope `@<你的npm用户名>/session-http-log`（scoped 包需先在 npm 创建 scope/org，并设 `"publishConfig": { "access": "public" }`）。 |
+| `name` | `@local/dsh-plugin-session-http-log` | `@local` 是本地占位 scope，不能发布。改成未被占用的名字，例如 `dsh-plugin-session-http-log`（查询 npm registry 时可用），或你自己的 scope `@<你的npm用户名>/dsh-plugin-session-http-log`（scoped 包需先在 npm 创建 scope/org，并设 `"publishConfig": { "access": "public" }`）。 |
 | `private` | `true` | 删除该字段（或设为 `false`），否则 `npm publish` 会直接拒绝。 |
 | `repository` | 未设置 | 建议补上 GitHub 仓库地址（`{"type":"git","url":"git+https://github.com/<owner>/<repo>.git"}`）。它也是 npm `--provenance` 生效的前提；缺省时发布 workflow 会跳过 provenance。 |
 | `license` / `keywords` / `homepage` | 未设置 | 可选，但公开包建议补齐。 |
@@ -148,21 +147,22 @@ git push && git push --tags  # 触发 .github/workflows/publish.yml
 发布后安装：
 
 ```bash
-dsh plugin --profile web add dsh-session-http-log   # 或 @<scope>/session-http-log
+dsh plugin --profile web add dsh-plugin-session-http-log   # 或 @<scope>/dsh-plugin-session-http-log
 ```
 
-之后 Plugin Manager 会把它当作可检查更新的 registry 包。注意：**改名后本机已安装的
-`@local/session-http-log` 是另一个包名**，需要先卸载旧的再装 npm 版本（抓包数据目录不受影响）。
+之后 Plugin Manager 会把它当作可检查更新的 registry 包。注意：**registry 包名与本地占位的
+`@local/dsh-plugin-session-http-log` 是不同包名**；本机若还装着改名前的 `@local/session-http-log`，
+需要先卸载旧包再安装（抓包数据目录不受影响）。
 
-如果确认要用 `dsh-session-http-log` 这个名字，我可以直接把 `package.json` 改好、重装本地
-插件并跑一遍完整验证。
+`package.json` 已经使用 `@local/dsh-plugin-session-http-log`，发布前只需按上表去掉 `@local`
+占位 scope 并移除 `"private": true`。
 
 ## 卸载
 
 **Plugins 页面**：找到 **会话 HTTP 记录**，选择 **卸载**。命令行等价方式：
 
 ```bash
-dsh plugin --profile web remove @local/session-http-log
+dsh plugin --profile web remove @local/dsh-plugin-session-http-log
 ```
 
 > 两种方式**效果完全一致**：Web 页面的“卸载”和 `dsh plugin remove` 都走同一个
@@ -181,9 +181,9 @@ dsh plugin --profile web remove @local/session-http-log
 | 内容 | 卸载时 | 说明 |
 |---|---|---|
 | profile `package.json` 的依赖与 bundle 列表 | ✅ 自动清理 | 回到安装前的选择，不留“核心配置修改记录”。 |
-| `pnpm-lock.yaml`、profile `node_modules` 中的包 | ✅ 自动清理 | 本地目录安装是 `link:` 链接；实测 pnpm 可能残留一个失效符号链接（`profile/node_modules/@local/session-http-log`），不影响启动，可手动删除或忽略。 |
+| `pnpm-lock.yaml`、profile `node_modules` 中的包 | ✅ 自动清理 | 本地目录安装是 `link:` 链接；实测 pnpm 可能残留一个失效符号链接（升级/改名前的旧包名，如 `profile/node_modules/@local/session-http-log`），不影响启动，可手动删除或忽略。 |
 | profile `cordis.patch.yml`、`~/.dsh` 下的 home patch / `settings.yaml` | — 从未写入 | 本插件的安装与卸载都不修改这些文件（已检查：它们中始终没有本插件条目）。 |
-| 运行中的插件实例 | ✅ 随卸载释放 | 还原 fetch 包装、移除 `/api/session-http-log/*` 路由；页面中的面板在刷新后消失。 |
+| 运行中的插件实例 | ✅ 随卸载释放 | 还原 fetch 包装、移除 `/api/dsh-plugin-session-http-log/*` 路由；页面中的面板在刷新后消失。 |
 | HTTP 记录数据（`$DSH_HOME/session-http-log/`） | ❌ **保留** | 这是用户的抓包数据，卸载不删除。彻底清理请手动删除该目录（或自定义的 `dataDir`）。 |
 | Plugin Manager 操作日志（`profile/.plugin-manager/logs`） | ❌ 保留 | 运维日志，可手动清理或忽略。 |
 | 插件源码目录（本地 `link:` 安装时） | ❌ 保留 | 本地安装只是链接，删除链接不会删除源码；不需要时手动删除包目录。 |
@@ -192,9 +192,9 @@ dsh plugin --profile web remove @local/session-http-log
 彻底清空所有痕迹（含抓包数据）示例：
 
 ```bash
-dsh plugin --profile web remove @local/session-http-log   # 或使用 Plugins 页面移除
+dsh plugin --profile web remove @local/dsh-plugin-session-http-log   # 或使用 Plugins 页面移除
 rm -rf "$DSH_HOME/session-http-log"                       # 删掉抓包数据（若是自定义 dataDir 则换路径）
-rm -rf <本包目录>  # 如不再需要插件源码
+rm -rf <本包目录>                                         # 如不再需要插件源码
 ```
 
 ### npx 安装 vs 桌面版
@@ -217,6 +217,8 @@ rm -rf <本包目录>  # 如不再需要插件源码
   原有 Session log 只保存会话事件，不保存 HTTP 原始报文；本插件另外抓取并另外存储。
 - 默认每个会话一个 JSONL 文件：`$DSH_HOME/session-http-log/<sessionId>.jsonl`
   （通常为 `~/.dsh/session-http-log/`），每行是一条完整记录（含原始报文）。
+- 目录名固定为 `session-http-log`，**不随插件包名 / 插件 id 改名**：这样改名后历史抓包数据
+  仍在面板里可见，不会被“搬空”。
 - 该目录内还会自动生成一个 `README.txt`，说明这目录的用途以及“卸载插件不会删除本目录”。
 - 面板里的“占用空间”是本会话记录在内存中的估算大小；悬停提示里的“磁盘”是上述 JSONL 的
   实际大小；点击 **打开目录** 可直接定位。
@@ -226,7 +228,7 @@ rm -rf <本包目录>  # 如不再需要插件源码
 
 ## 配置
 
-在 bundle patch 的 `session-http-log` 行 `config` 中修改（profile 的 patch 层会实时生效）：
+在 bundle patch 的 `dsh-plugin-session-http-log` 行 `config` 中修改（profile 的 patch 层会实时生效）：
 
 | 字段 | 默认值 | 含义 |
 |---|---:|---|
@@ -258,7 +260,7 @@ Plugin Manager 中为“包名@版本 + 运行时版本”这一精确组合授�
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半：fetch 观测器、按会话存储、JSONL 持久化、`/api/session-http-log/*` 鉴权路由。 |
+| `index.js` | Host 半：fetch 观测器、按会话存储、JSONL 持久化、`/api/dsh-plugin-session-http-log/*` 鉴权路由。 |
 | `client.js` | 浏览器半：右侧边栏 tab 类型与面板、中/英字典、主题 token 样式、面板内语言切换。 |
 | `locale/*.json` | Plugin Manager 的显示元数据（标题/描述），不是运行期词典。 |
 | `icon.svg` | 插件图标。 |

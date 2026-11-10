@@ -1,6 +1,6 @@
 - insert:
-    - id: session-http-log
-      name: '@local/session-http-log'
+    - id: dsh-plugin-session-http-log
+      name: '@local/dsh-plugin-session-http-log'
       config:
         maxRequestsPerSession: 500
         maxSessionBytes: 33554432
