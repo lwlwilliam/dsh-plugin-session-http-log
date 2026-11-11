@@ -5,7 +5,7 @@
  * （LLM API 调用、网页搜索/抓取、MCP HTTP 等），把每次交换归属到
  * 发起它的会话，按会话保留一份有上限的内存日志，并按配置
  * 以 JSONL 追加到 `$DSH_HOME/session-http-log`（目录名保持稳定，不随
- * 插件改名迁移，以免已有抓包数据在面板中消失），同时提供五个
+ * 插件改名迁移，以免已有抓包数据在面板中消失），同时提供八个
  * 经过身份校验的 `/api/dsh-plugin-session-http-log/*` 路由供客户端面板读取。
  *
  * 本模块必须保持自包含：从已安装的 bundle 位置只能解析 Node 内置模块，
@@ -16,6 +16,8 @@
  *   GET  /api/dsh-plugin-session-http-log/record?sessionId&id      → 单条完整记录
  *   POST /api/dsh-plugin-session-http-log/clear                    → { ok, removed }
  *   POST /api/dsh-plugin-session-http-log/clear-all                → { ok, removedSessions, removedRecords, removedFiles }
+ *   GET  /api/dsh-plugin-session-http-log/usage                    → 所有会话抓包文件总大小（含不活跃会话占用）
+ *   POST /api/dsh-plugin-session-http-log/clear-inactive           → { ok, removedSessions, removedFiles, freedBytes }
  *   GET  /api/dsh-plugin-session-http-log/har?sessionId            → HAR 1.2 归档
  *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir }（打开数据目录）
  *
@@ -33,10 +35,10 @@ import { dirname, join } from 'node:path'
 
 /** 配置默认值，见 CONTRACT.md。 */
 const DEFAULT_MAX_REQUESTS_PER_TURN = 200
-const DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+const DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
-const DEFAULT_MAX_TURN_BYTES = 16 * 1024 * 1024
-const DEFAULT_MAX_LOG_FILE_BYTES = 8 * 1024 * 1024
+const DEFAULT_MAX_TURN_BYTES = 32 * 1024 * 1024
+const DEFAULT_MAX_LOG_FILE_BYTES = 32 * 1024 * 1024
 /** 自动清理：最后写入后保留 24 小时，之后在清理扫描中删除。 */
 const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
 /** 自动清理扫描间隔：每天一轮；插件启动后另有一次立即扫描。 */
@@ -50,6 +52,8 @@ const ROUTE_PATHS = Object.freeze({
   record: '/api/dsh-plugin-session-http-log/record',
   clear: '/api/dsh-plugin-session-http-log/clear',
   clearAll: '/api/dsh-plugin-session-http-log/clear-all',
+  usage: '/api/dsh-plugin-session-http-log/usage',
+  clearInactive: '/api/dsh-plugin-session-http-log/clear-inactive',
   har: '/api/dsh-plugin-session-http-log/har',
   reveal: '/api/dsh-plugin-session-http-log/reveal',
 })
@@ -174,7 +178,7 @@ const requestsByBody = new WeakMap()
 export const inject = ['connection']
 
 /**
- * 安装 fetch 观察器以及五个经过身份校验的路由；持久化开启时还会在数据目录
+ * 安装 fetch 观察器以及八个经过身份校验的路由；持久化开启时还会在数据目录
  * 内放置一份清理提示说明文件。
  * @param {import('@deepseek-ai/cordis').Context} ctx - 宿主插件上下文。
  * @param {object} [config] - patch 行配置，按防御式读取。
@@ -422,6 +426,8 @@ function createRuntime(ctx, config) {
   let clearingAll = false
   /** 合并并发的“清空全部”请求，保证删除过程只有一个执行者。 */
   let clearingAllPromise = null
+  /** 合并并发的“清空不活跃”请求，避免两轮删除重叠。 */
+  let clearingInactivePromise = null
   /** 防止定时器和手动触发产生重叠的日志清理扫描。 */
   let sweepingLogs = false
 
@@ -999,11 +1005,11 @@ function createRuntime(ctx, config) {
       if (entry.logBytes === null) entry.logBytes = await fileSize(file)
       const indexFile = sessionIndexFile(sessionId)
       if (entry.logBytes > 0 && entry.logBytes + bytes > config.maxLogFileBytes) {
-        // 单轮磁盘上限：保留最近约 1/4 上限的记录（最多 2 MiB），
+        // 单轮磁盘上限：保留最近约 1/4 上限的记录（最多 8 MiB），
         // 然后同时重写正文和轻量索引。其它会话的文件完全不受影响。
         const tailBudget = Math.max(
           1024,
-          Math.min(2 * 1024 * 1024, Math.floor(config.maxLogFileBytes / 4)),
+          Math.min(8 * 1024 * 1024, Math.floor(config.maxLogFileBytes / 4)),
         )
         const tail = rotationTail(entry.records, record, tailBudget)
         await mkdir(dirname(file), { recursive: true })
@@ -1335,15 +1341,28 @@ function createRuntime(ctx, config) {
       }
       const now = Date.now()
       const retained = []
-      const unusedIndexFiles = new Set()
-      let totalBytes = 0
+      // readdir 顺序不稳定，先按文件名判断索引是否有同名正文，不能靠单趟遍历
+      // 顺序把仍有效的 `.jsonl.idx` 误当成孤儿索引删除。
+      const names = []
       for (const dirent of entries) {
         if (dirent === null || typeof dirent !== 'object' || dirent.isFile?.() !== true) continue
-        const name = String(dirent.name)
-        if (name.endsWith('.jsonl.idx')) {
-          unusedIndexFiles.add(join(config.dataDir, name))
-          continue
-        }
+        names.push(String(dirent.name))
+      }
+      const bodyFiles = new Set()
+      for (const name of names) {
+        if (!name.endsWith('.jsonl')) continue
+        if (SESSION_ID_PATTERN.test(name.slice(0, -'.jsonl'.length))) bodyFiles.add(name)
+      }
+      const unusedIndexFiles = new Set()
+      for (const name of names) {
+        if (!name.endsWith('.jsonl.idx')) continue
+        const sessionId = name.slice(0, -'.jsonl.idx'.length)
+        if (!SESSION_ID_PATTERN.test(sessionId)) continue
+        if (bodyFiles.has(sessionId + '.jsonl')) continue
+        unusedIndexFiles.add(join(config.dataDir, name))
+      }
+      let totalBytes = 0
+      for (const name of names) {
         if (!name.endsWith('.jsonl')) continue
         const sessionId = name.slice(0, -'.jsonl'.length)
         if (!SESSION_ID_PATTERN.test(sessionId)) continue
@@ -1357,14 +1376,11 @@ function createRuntime(ctx, config) {
           continue
         }
         let indexSize = 0
-        if (unusedIndexFiles.has(indexFile)) {
-          try {
-            const indexInfo = await stat(indexFile)
-            indexSize = typeof indexInfo.size === 'number' ? indexInfo.size : 0
-            unusedIndexFiles.delete(indexFile)
-          } catch {
-            /* 索引损坏/缺失时只保留正文大小 */
-          }
+        try {
+          const indexInfo = await stat(indexFile)
+          indexSize = typeof indexInfo.size === 'number' ? indexInfo.size : 0
+        } catch {
+          /* 索引损坏/缺失时只保留正文大小 */
         }
         const size = (typeof info.size === 'number' ? info.size : 0) + indexSize
         const mtimeMs = typeof info.mtimeMs === 'number' ? info.mtimeMs : 0
@@ -1821,6 +1837,161 @@ function createRuntime(ctx, config) {
   }
 
   /**
+   * 扫描数据目录中的会话抓包文件。
+   * 口径与每日清理、`clear-all` 一致：只认文件名符合会话 id 规则的
+   * `*.jsonl` 与 `*.jsonl.idx`；README 与未知文件不计入。持久化关闭时返回
+   * 空数组，目录不存在或扫描失败也不会让路由失败。
+   * @returns {Promise<Array<{sessionId: string, bytes: number}>>}
+   */
+  async function scanCaptureFiles() {
+    if (config.persist !== true) return []
+    let entries
+    try {
+      entries = await readdir(config.dataDir, { withFileTypes: true })
+    } catch (error) {
+      if (error?.code !== 'ENOENT') reportOnce('usage-readdir', error)
+      return []
+    }
+    const files = []
+    for (const dirent of entries) {
+      if (dirent === null || typeof dirent !== 'object' || dirent.isFile?.() !== true) continue
+      const name = String(dirent.name)
+      const sessionId = name.endsWith('.jsonl.idx')
+        ? name.slice(0, -'.jsonl.idx'.length)
+        : name.endsWith('.jsonl')
+          ? name.slice(0, -'.jsonl'.length)
+          : ''
+      if (sessionId === '' || !SESSION_ID_PATTERN.test(sessionId)) continue
+      try {
+        const info = await stat(join(config.dataDir, name))
+        files.push({ sessionId, bytes: typeof info.size === 'number' ? info.size : 0 })
+      } catch (error) {
+        if (error?.code !== 'ENOENT') reportOnce(`usage-stat:${name}`, error)
+      }
+    }
+    return files
+  }
+
+  /**
+   * 汇总“不活跃”抓包：会话已归档，或已删除（不在 live Session 与
+   * sessionPersistence 中）。这与每日清理判定“可删除”的口径一致，覆盖
+   * **所有工作区**；面板正在查看的会话（`excludeSessionId`）始终保留。
+   * `knownSessionIds()` 不可用时返回 `inactiveAvailable: false`，客户端据此
+   * 隐藏“清空不活跃”入口，绝不能猜删。
+   * @param {Array<{sessionId: string, bytes: number}>} files - 扫描结果。
+   * @param {Set<string>|null} knownSessionIds - 现存（未归档）会话 id 集合。
+   * @param {string} excludeSessionId - 始终保留的会话 id（可为空）。
+   * @returns {{inactiveAvailable: boolean, inactiveSessions: number, inactiveFiles: number, inactiveBytes: number}}
+   */
+  function summarizeInactive(files, knownSessionIds, excludeSessionId) {
+    if (knownSessionIds === null) {
+      return { inactiveAvailable: false, inactiveSessions: 0, inactiveFiles: 0, inactiveBytes: 0 }
+    }
+    const bySession = new Map()
+    for (const file of files) {
+      if (knownSessionIds.has(file.sessionId) || file.sessionId === excludeSessionId) continue
+      const bucket = bySession.get(file.sessionId) ?? { files: 0, bytes: 0 }
+      bucket.files += 1
+      bucket.bytes += file.bytes
+      bySession.set(file.sessionId, bucket)
+    }
+    let inactiveFiles = 0
+    let inactiveBytes = 0
+    for (const bucket of bySession.values()) {
+      inactiveFiles += bucket.files
+      inactiveBytes += bucket.bytes
+    }
+    return { inactiveAvailable: true, inactiveSessions: bySession.size, inactiveFiles, inactiveBytes }
+  }
+
+  /**
+   * `GET /usage` → 所有会话抓包文件的磁盘总大小，以及其中不活跃会话的占用。
+   * 直接扫描数据目录，因此也覆盖没有打开面板、但文件仍在磁盘上的会话。
+   * 查询参数 `sessionId`（可选）表示面板正在查看的会话，永不归入不活跃。
+   * @param {Request} request - 路由请求。
+   * @returns {Promise<Response>}
+   */
+  async function handleUsageRequest(request) {
+    const url = new URL(request.url)
+    const requested = url.searchParams.get('sessionId') ?? ''
+    const excludeSessionId = SESSION_ID_PATTERN.test(requested) ? requested : ''
+    const files = await scanCaptureFiles()
+    const sessionIds = new Set()
+    let bytes = 0
+    for (const file of files) {
+      sessionIds.add(file.sessionId)
+      bytes += file.bytes
+    }
+    return jsonResponse({
+      dir: config.dataDir,
+      persist: config.persist === true,
+      maxTotalBytes: config.maxTotalBytes,
+      sessions: sessionIds.size,
+      files: files.length,
+      bytes,
+      ...summarizeInactive(files, await knownSessionIds(), excludeSessionId),
+    })
+  }
+
+  /**
+   * 清空不活跃会话的抓包文件：删除已归档或已删除（不在 live Session 与
+   * sessionPersistence 中）的会话文件，覆盖所有工作区。复用 `removeLogFile`
+   * 的文件队列与“进行中捕获”保护；会话列表不可用时不执行任何删除。
+   * @param {string} excludeSessionId - 始终保留的会话 id（可为空）。
+   * @returns {Promise<{removedSessions: number, removedFiles: number, freedBytes: number}|null>}
+   */
+  function clearInactiveSessions(excludeSessionId) {
+    if (clearingInactivePromise !== null) return clearingInactivePromise
+    clearingInactivePromise = (async () => {
+      const files = await scanCaptureFiles()
+      const known = await knownSessionIds()
+      if (known === null) return null
+      const bySession = new Map()
+      for (const file of files) {
+        if (known.has(file.sessionId) || file.sessionId === excludeSessionId) continue
+        const bucket = bySession.get(file.sessionId) ?? { files: 0, bytes: 0 }
+        bucket.files += 1
+        bucket.bytes += file.bytes
+        bySession.set(file.sessionId, bucket)
+      }
+      let removedSessions = 0
+      let removedFiles = 0
+      let freedBytes = 0
+      for (const [sessionId, bucket] of bySession) {
+        const removed = await removeLogFile(sessionId, sessionFile(sessionId))
+        if (!removed) continue
+        removedSessions += 1
+        removedFiles += bucket.files
+        freedBytes += bucket.bytes
+      }
+      return { removedSessions, removedFiles, freedBytes }
+    })().finally(() => {
+      clearingInactivePromise = null
+    })
+    return clearingInactivePromise
+  }
+
+  /**
+   * `POST /clear-inactive` → 清空不活跃会话的抓包文件。
+   * body 可选 `{ "sessionId": "…" }`：面板正在查看的会话始终保留。
+   * @param {Request} request - 路由请求。
+   * @returns {Promise<Response>}
+   */
+  async function handleClearInactiveRequest(request) {
+    let payload = null
+    try {
+      payload = await request.json()
+    } catch {
+      payload = null
+    }
+    const requested = payload !== null && typeof payload === 'object' ? payload.sessionId : undefined
+    const excludeSessionId = typeof requested === 'string' && SESSION_ID_PATTERN.test(requested) ? requested : ''
+    const result = await clearInactiveSessions(excludeSessionId)
+    if (result === null) return errorResponse(503, 'session list is unavailable')
+    return jsonResponse({ ok: true, ...result })
+  }
+
+  /**
    * `GET /record` → 返回一条完整记录，不存在时返回 404。
    * @param {Request} request - 路由请求。
    * @returns {Promise<Response>}
@@ -2163,6 +2334,8 @@ function createRuntime(ctx, config) {
     { path: ROUTE_PATHS.record, methods: ['GET', 'HEAD'], handler: handleRecordRequest },
     { path: ROUTE_PATHS.clear, methods: ['POST'], handler: handleClearRequest },
     { path: ROUTE_PATHS.clearAll, methods: ['POST'], handler: handleClearAllRequest },
+    { path: ROUTE_PATHS.usage, methods: ['GET', 'HEAD'], handler: handleUsageRequest },
+    { path: ROUTE_PATHS.clearInactive, methods: ['POST'], handler: handleClearInactiveRequest },
     { path: ROUTE_PATHS.har, methods: ['GET', 'HEAD'], handler: handleHarRequest },
     { path: ROUTE_PATHS.reveal, methods: ['POST'], handler: handleRevealRequest },
   ]
@@ -2226,8 +2399,14 @@ async function captureBody(body, limit, signal, onProgress) {
           break
         }
         chunk = item.value
-      } catch {
-        truncated = bytes > 0
+      } catch (error) {
+        // 调用方在读取完响应后主动 abort（模型适配器收到 message_stop 后
+        // 就会这样做）会让 clone 读取器以 AbortError 结束；此时已经读到的
+        // 字节通常就是完整报文，不能因此标成“截断”。只有插件自身的
+        // captureSignal 中止或真实传输错误才保留截断标记。
+        if (aborted === true || isAbortError(error) === false) {
+          truncated = bytes > 0
+        }
         break
       }
       if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0) continue
@@ -2662,6 +2841,18 @@ function errorMessage(error) {
   } catch {
     return 'unrenderable error'
   }
+}
+
+/**
+ * 判断一个流读取错误是否来自主动中止，而不是传输故障。
+ * @param {unknown} error - 读取器抛出的错误。
+ * @returns {boolean}
+ */
+function isAbortError(error) {
+  if (error === null || typeof error !== 'object') return false
+  if (error.name === 'AbortError' || error.code === 20) return true
+  const cause = error.cause
+  return cause !== null && typeof cause === 'object' && (cause.name === 'AbortError' || cause.code === 20)
 }
 
 /**

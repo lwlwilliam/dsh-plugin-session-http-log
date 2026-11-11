@@ -72,13 +72,13 @@ schemastery，不导出 `Config`）：
 
 ```
 maxRequestsPerTurn:   200               // 当前轮内存条数上限
-maxTurnBytes:         16 * 1024 * 1024  // 当前轮内存字节安全阀
-maxRequestBodyBytes:  2 * 1024 * 1024
+maxTurnBytes:         32 * 1024 * 1024  // 当前轮内存字节安全阀
+maxRequestBodyBytes:  8 * 1024 * 1024
 maxResponseBodyBytes: 4 * 1024 * 1024
 redactSensitiveHeaders: true
 persist: true
 dataDir: ''            // 默认：$DSH_HOME/session-http-log（回退 ~/.dsh/session-http-log）
-maxLogFileBytes: 8 * 1024 * 1024    // 当前轮磁盘上限；达到后只重写本文件并保留最近尾部
+maxLogFileBytes: 32 * 1024 * 1024   // 当前轮磁盘上限；达到后只重写本文件并保留最近尾部
 retentionMs: 24 * 60 * 60 * 1000    // 最后写入后保留多久；每日清理时删除超期文件
 cleanupLogs: true                   // 每日清理孤儿/归档、过期文件与全局总容量
 cleanupIntervalMs: 24 * 60 * 60 * 1000 // 每日扫描；启动后约 1 秒先扫一次
@@ -103,7 +103,9 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      二进制存 base64。
    - 抓**响应**：状态、状态文本、响应头、content-type，以及响应体原始字节
      （`response.clone().body`，上限 `maxResponseBodyBytes`；同一套文本/二进制规则）。
-     抓取超过上限时取消 clone 读取，不能阻塞调用方的流。
+     抓取超过上限时取消 clone 读取，不能阻塞调用方的流。调用方在流读完后主动 abort
+     （模型适配器收到 `message_stop` 后就会这样做）会让 clone reader 以 `AbortError`
+     结束；此时已读字节保留且**不**标记为 truncated，真实传输错误或抓取上限仍标记。
    - 计时：调用时 `startedAt`，收到响应头时 `durationMs`，响应体抓取结束时 `completedAt`。
      请求被 reject 时记录 `error`（只存 message，不存 stack）。
    - 当 `redactSensitiveHeaders` 为 true 时，把 `authorization`、`proxy-authorization`、
@@ -132,7 +134,7 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      持久化是 fire-and-forget：抓包 finalize 只入队、不 await 写盘；队列任务先 `setImmediate`
      让出事件循环，再序列化/写文件。`dispose` 会等待待写队列完成。
    - 单轮正文文件达到 `maxLogFileBytes` 时重写正文和索引，保留最近约 1/4 上限的已完成记录
-     （至少保留当前记录），不影响其它会话。
+     （最多保留 8 MiB，且至少保留当前记录），不影响其它会话。
    - 冷读只读 `.jsonl.idx`，按 payload 行偏移懒读取 `/record` 详情；不存在索引的旧版完整
      JSONL 会在首次冷读时重建一次索引。HAR 导出是唯一会批量读取全部 body 的常规例外。
    - 列表响应带基于 `generation + revision + 条数 + 最后 id + fileBytes` 的 ETag；
@@ -173,6 +175,24 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      清空所有会话内存记录并删除数据目录中所有符合会话 id 规则的 `*.jsonl` 与
      `.jsonl.idx`；保留 `README.txt` 和未知文件。
      删除期间暂停新捕获，避免清理与写入竞态。
+   - `GET /api/dsh-plugin-session-http-log/usage?sessionId=…` →
+     `{ dir, persist, maxTotalBytes, sessions, files, bytes, inactiveAvailable,
+     inactiveSessions, inactiveFiles, inactiveBytes }`：扫描 `dataDir` 统计**所有会话**
+     抓包文件的磁盘总大小；口径与每日清理/`clear-all` 一致，只统计文件名符合会话 id 规则的
+     `*.jsonl` 与 `*.jsonl.idx`（`README.txt`、未知文件不计入），`sessions` = 去重后的会话数，
+     `files` = 文件数，`bytes` = 总字节。**不活跃** = **已归档**（`workspaceRegistry
+     .archivedSessionIds`）或**已删除**（既不在 live Session、也不在 `sessionPersistence`）
+     的会话，覆盖所有工作区；判定复用每日清理的 `knownSessionIds()`（现存且未归档的会话集合）。
+     面板会话（查询参数 `sessionId`，可为空）始终不计入不活跃；对应字段为
+     `inactiveSessions`/`inactiveFiles`/`inactiveBytes`。会话列表不可用（`knownSessionIds()`
+     返回 null）时 `inactiveAvailable` 为 false、三个计数为 0——客户端据此隐藏“清空不活跃”，
+     绝不能把“读不到”当成“全部已删除”。持久化关闭或目录不存在时各项为 0；扫描失败只记录一次
+     日志并返回 0，不让面板报错。
+   - `POST /api/dsh-plugin-session-http-log/clear-inactive` body 可选
+     `{ "sessionId": "…" }` → `{ ok: true, removedSessions, removedFiles, freedBytes }`：
+     删除已归档/已删除会话的抓包文件，覆盖所有工作区（`sessionId` 指向的面板会话始终保留）。
+     删除复用文件队列与“进行中捕获”保护；会话列表不可用时返回 503 `{ error }`，不执行任何
+     删除。并发调用合并为一次执行。
    - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
      目录（平台默认或 `openDirectoryCommand`）。WSL 下必须把 Linux 路径转换为 Windows 路径
      （优先 `wslpath -w`，回退到 `/mnt/<drive>` 或 `\\wsl.localhost\<distro>`），再交给 Windows
@@ -235,16 +255,25 @@ window.__ModuleLoader__.load({
   带 `If-None-Match`，304 时不更新状态，跳过重叠请求，卸载/不可见时 abort）；刷新按钮；选中时先取
   `part=meta` 详情，正文区块展开时才取 `part=requestBody|responseBody`；清空当前会话按钮 POST
   `api/dsh-plugin-session-http-log/clear`；清空全部按钮在二次确认后 POST
-  `api/dsh-plugin-session-http-log/clear-all`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
+  `api/dsh-plugin-session-http-log/clear-all`；导出按钮下载 HAR（Blob + 临时 `<a download>`）；
+  另以约 8 秒间隔轮询 `GET api/dsh-plugin-session-http-log/usage?sessionId=…` 展示所有会话抓包
+  文件的总大小与其中不活跃会话的占用（面板不可见时停止；失败时静默保留上一次值；手动刷新、
+  清空当前会话、清空全部、清空不活跃后立即重取）。
 - 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空当前会话、导出、打开目录）；
-  “清空全部”放在标题栏右侧语言切换旁，二次确认后调用 clear-all；
+  “清空全部”放在标题栏右侧语言切换旁，其左侧显示**所有会话抓包文件的磁盘总大小**
+  （悬停提示文件数、会话数、`maxTotalBytes` 全局上限与目录；持久化关闭时隐藏），
+  二次确认后调用 clear-all；
+  **清空不活跃**按钮紧挨着“清空全部”放在标题栏右侧（同一 ghost 样式），标签中直接显示
+  不活跃会话的占用大小（`header.clearInactive`，如“清空不活跃 (2.1 MB)”），悬停提示
+  文件数/会话数与“现存会话不会被清理”；不活跃为 0 或口径不可用时禁用/隐藏，二次确认后
+  调用 clear-inactive（当前查看的会话始终保留）；标题行允许换行，窄边栏下操作组整体换到下一行；
   持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示保留策略：
   只保留最新一轮、单轮 `maxLogFileBytes` 上限、`retentionMs` 过期清理；文案必须说明
   打开目录、清空当前会话与清空全部功能仍然可用，不得把自动清理描述成只影响一个会话。
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。
 - 行：方法 chip、路径（tooltip 为完整 URL）、按状态着色的状态 chip（2xx success、3xx idle、
-  4xx warn、5xx error、pending idle）、耗时、大小、本地 HH:MM:SS。选中行用
+  4xx warn、5xx error、pending idle）、耗时、大小（请求体 ↑ / 响应体 ↓，tooltip 分别显示两者）、本地 HH:MM:SS。选中行用
   `--dsw-alias-brand-primary` 高亮；点击行展开/再次点击折叠。
 - 详情：概览网格、请求头表、请求体、响应头表、响应体、错误行；body 用 `<pre>`（可换行或横向
   滚动，限高）；JSON body 提供原始/美化切换，默认“原始报文”；每个 body/headers/URL 提供复制，
@@ -262,11 +291,14 @@ window.__ModuleLoader__.load({
    `{ currentInitiator: () => ({ id: 'session-test' }) }`，`get('connection')` 记录路由，
    `effect(cb)` 立即执行并保留 cleanup；对本地 `node:http` 服务器安装插件；调用
    `fetch(url, { method:'POST', body: JSON.stringify({model:'m'}), headers })`；断言抓到的记录
-   含原始请求/响应文本、请求头、计时、`kind:'llm'`；断言 list/detail/clear/HAR/reveal 路由；
+   含原始请求/响应文本、请求头、计时、`kind:'llm'`；断言 list/detail/clear/HAR/reveal/usage 路由；
    断言字节预算淘汰、单会话超 `maxLogFileBytes` 后旧文件被重写且保留最近尾部并继续写、
    `turn/start` 后上一轮内存和文件被清空且新轮继续写、摘要索引冷读与 `part` 懒加载详情、
    ETag/304、过期文件清理、`maxTotalBytes` 全局淘汰、`clear-all` 删除全部会话文件但保留
-   `README.txt`、WSL reveal 把 Windows 路径传给
+   `README.txt`、`usage` 汇总所有会话文件（关闭持久化时全 0，`clear-all` 后归零且不统计未知文件）、
+   `usage` 的不活跃统计只包含已归档/已删除会话（全局）并排除面板会话、
+   `clear-inactive` 只删这些文件并保留现存/面板会话、
+   WSL reveal 把 Windows 路径传给
    `explorer.exe`、未知/已归档会话的 JSONL 被清理且有效文件保留；dispose 后
    `globalThis.fetch` 还原。
 3. Client 冒烟测试（`test/client-smoke.mjs`）：伪 React + 伪客户端上下文加载真实 `client.js`，

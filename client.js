@@ -14,6 +14,8 @@ window.__ModuleLoader__.load({
     const ROUTE = 'api/dsh-plugin-session-http-log'
     /** 面板挂载且自动刷新开启时的列表刷新间隔。 */
     const POLL_INTERVAL_MS = 1200
+    /** “所有会话总大小”独立轮询间隔：目录扫描比列表轮询贵，放慢一些。 */
+    const USAGE_POLL_INTERVAL_MS = 8000
     /** 服务端列表上限；面板不会请求更多。 */
     const LIST_LIMIT = 500
     /** 复制按钮保留“已复制”/“复制失败”反馈的时长。 */
@@ -84,6 +86,7 @@ window.__ModuleLoader__.load({
       'detail.model': 'Model',
       'detail.requestSize': 'Request size',
       'detail.responseSize': 'Response size',
+      'detail.totalSize': 'Total size',
       'detail.contentType': 'Content type',
       'detail.locate': 'Locate in list',
       'detail.locateTitle': 'Scroll the request list to this record',
@@ -103,10 +106,20 @@ window.__ModuleLoader__.load({
       'lang.zhShort': '中',
       'row.expand': 'Expand request details',
       'row.collapse': 'Collapse request details',
+      'row.sizePair': '↑{request} ↓{response}',
+      'row.sizeTooltip': 'Request body: {request}\nResponse body: {response}',
       'section.expand': 'Expand section',
       'section.collapse': 'Collapse section',
       'header.space': '{memory} occupied',
-      'header.spaceTooltip': 'Memory estimate: {memory}\nOn disk: {disk}\nDirectory: {dir}',
+      'header.spaceTooltip': 'Memory estimate: {memory} / per-turn cap {memoryLimit}\nOn disk: {disk} / turn-file cap {fileLimit}\nDirectory: {dir}',
+      'header.allSessions': 'All {size}',
+      'header.allSessionsTooltip': 'All session captures on disk across workspaces (incl. .jsonl.idx): {size}\n{files} files / {sessions} sessions\nGlobal cap: {limit}\nDirectory: {dir}',
+      'header.noLimit': 'no cap',
+      'header.clearInactive': 'Clear inactive ({size})',
+      'header.clearInactiveTitle': 'Delete HTTP captures of archived or deleted sessions: {files} files / {sessions} sessions. The current session and other existing sessions are kept.',
+      'header.clearInactiveConfirm': 'Delete archived/deleted session captures ({size}: {sessions} sessions / {files} files)? This cannot be undone; existing sessions are kept.',
+      'header.clearInactiveConfirmYes': 'Delete inactive captures',
+      'header.clearingInactive': 'Clearing inactive…',
       'header.retention': 'Only the latest turn is kept. Turn file cap: {limit}; captures not updated for {hours}h are cleaned up automatically.',
       'header.retentionTitle': 'A new turn clears the previous turn for this session. The turn file is capped, and idle files expire on the daily cleanup. Other sessions are handled independently; the Open folder and Clear actions remain available.',
       'header.spaceUninstallNote': 'Uninstalling the plugin does not delete this directory.',
@@ -119,6 +132,7 @@ window.__ModuleLoader__.load({
       'error.export': 'HAR export failed: {message}',
       'error.clear': 'Clear failed: {message}',
       'error.clearAll': 'Could not clear all captures: {message}',
+      'error.clearInactive': 'Could not clear inactive captures: {message}',
     }
     const zh = {
       'tab.title': '会话 HTTP 记录',
@@ -174,6 +188,7 @@ window.__ModuleLoader__.load({
       'detail.model': '模型',
       'detail.requestSize': '请求大小',
       'detail.responseSize': '响应大小',
+      'detail.totalSize': '合计大小',
       'detail.contentType': '内容类型',
       'detail.locate': '定位',
       'detail.locateTitle': '在请求列表中定位此记录',
@@ -193,10 +208,20 @@ window.__ModuleLoader__.load({
       'lang.zhShort': '中',
       'row.expand': '展开请求详情',
       'row.collapse': '收起请求详情',
+      'row.sizePair': '↑{request} ↓{response}',
+      'row.sizeTooltip': '请求体：{request}\n响应体：{response}',
       'section.expand': '展开此区块',
       'section.collapse': '收起此区块',
       'header.space': '占用 {memory}',
-      'header.spaceTooltip': '内存估算：{memory}\n磁盘：{disk}\n目录：{dir}',
+      'header.spaceTooltip': '内存估算：{memory} / 每轮上限 {memoryLimit}\n磁盘：{disk} / 单轮文件上限 {fileLimit}\n目录：{dir}',
+      'header.allSessions': '全部 {size}',
+      'header.allSessionsTooltip': '所有工作区的会话抓包文件（含 .jsonl.idx 索引）：{size}\n{files} 个文件 / {sessions} 个会话\n全局上限：{limit}\n目录：{dir}',
+      'header.noLimit': '不限',
+      'header.clearInactive': '清空不活跃 ({size})',
+      'header.clearInactiveTitle': '删除已归档或已删除会话的 HTTP 抓包：{files} 个文件 / {sessions} 个会话。本面板会话与其它现存会话不会被清理。',
+      'header.clearInactiveConfirm': '删除已归档/已删除会话的抓包文件（{size}：{sessions} 个会话 / {files} 个文件）？此操作不可恢复；现存会话不受影响。',
+      'header.clearInactiveConfirmYes': '清空不活跃记录',
+      'header.clearingInactive': '正在清空不活跃…',
       'header.retention': '仅保留最新一轮：单轮文件上限 {limit}；超过 {hours} 小时未更新会自动清理。',
       'header.retentionTitle': '同一会话进入新一轮时会清空上一轮记录；单轮文件达到上限时只保留最近记录。每日清理会删除过期及已归档/已删除会话的文件；其它会话独立处理。打开目录与清空功能始终保留。',
       'header.spaceUninstallNote': '卸载插件不会删除该目录。',
@@ -209,6 +234,7 @@ window.__ModuleLoader__.load({
       'error.export': '导出 HAR 失败：{message}',
       'error.clear': '清空失败：{message}',
       'error.clearAll': '清空全部抓包失败：{message}',
+      'error.clearInactive': '清空不活跃抓包失败：{message}',
     }
 
     // ---------------------------------------------------------------------
@@ -219,7 +245,7 @@ window.__ModuleLoader__.load({
       '.shl-root{display:flex;flex-direction:column;flex:1 1 auto;min-width:0;min-height:0;height:100%;box-sizing:border-box;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.45}',
       '.shl-root *,.shl-root *::before,.shl-root *::after{box-sizing:border-box}',
       '.shl-header{display:flex;flex-direction:column;gap:6px;padding:8px 10px 7px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);min-width:0}',
-      '.shl-title-row{display:flex;align-items:center;gap:8px;min-width:0}',
+      '.shl-title-row{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}',
       '.shl-title-actions{margin-left:auto;display:flex;align-items:center;gap:6px;flex:0 0 auto}',
       '.shl-global-clear{color:var(--dsw-alias-label-secondary);border-color:transparent;background:transparent;padding:1px 6px;font-size:11px}',
       '.shl-global-clear:hover{color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-overlay)}',
@@ -274,6 +300,7 @@ window.__ModuleLoader__.load({
       '.shl-row[data-selected="true"] .shl-path{color:var(--dsw-alias-label-primary);font-weight:600}',
       '.shl-row[data-selected="true"] .shl-chevron{color:var(--dsw-alias-brand-primary)}',
       '.shl-space{flex:0 0 auto;color:var(--dsw-alias-label-secondary);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}',
+      '.shl-all-size{flex:0 0 auto;color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}',
       '.shl-section-toggle{display:inline-flex;align-items:center;gap:5px;min-width:0;padding:0;border:0;border-radius:4px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
       '.shl-section-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}',
       '.shl-section-body{display:flex;flex-direction:column;gap:4px;min-width:0}',
@@ -597,6 +624,39 @@ window.__ModuleLoader__.load({
       }
     }
 
+    async function fetchUsage(sessionId, signal) {
+      const query = new URLSearchParams()
+      if (typeof sessionId === 'string' && sessionId !== '') query.set('sessionId', sessionId)
+      const suffix = query.toString() === '' ? '' : '?' + query.toString()
+      const response = await fetch(ROUTE + '/usage' + suffix, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json' },
+        signal,
+      })
+      const payload = await readJsonResponse(response)
+      return {
+        bytes: typeof payload.bytes === 'number' && isFinite(payload.bytes) && payload.bytes > 0 ? payload.bytes : 0,
+        files: typeof payload.files === 'number' && isFinite(payload.files) && payload.files > 0 ? payload.files : 0,
+        sessions: typeof payload.sessions === 'number' && isFinite(payload.sessions) && payload.sessions > 0 ? payload.sessions : 0,
+        dir: typeof payload.dir === 'string' ? payload.dir : '',
+        persist: payload.persist === true,
+        maxTotalBytes: typeof payload.maxTotalBytes === 'number' && isFinite(payload.maxTotalBytes) && payload.maxTotalBytes > 0
+          ? payload.maxTotalBytes
+          : 0,
+        inactiveAvailable: payload.inactiveAvailable === true,
+        inactiveBytes: typeof payload.inactiveBytes === 'number' && isFinite(payload.inactiveBytes) && payload.inactiveBytes > 0
+          ? payload.inactiveBytes
+          : 0,
+        inactiveFiles: typeof payload.inactiveFiles === 'number' && isFinite(payload.inactiveFiles) && payload.inactiveFiles > 0
+          ? payload.inactiveFiles
+          : 0,
+        inactiveSessions: typeof payload.inactiveSessions === 'number' && isFinite(payload.inactiveSessions) && payload.inactiveSessions > 0
+          ? payload.inactiveSessions
+          : 0,
+      }
+    }
+
     async function fetchRecord(sessionId, id, signal, part = 'meta') {
       const response = await fetch(recordUrl(sessionId, id, part), {
         method: 'GET',
@@ -638,6 +698,17 @@ window.__ModuleLoader__.load({
         method: 'POST',
         credentials: 'same-origin',
         headers: { accept: 'application/json' },
+        signal,
+      })
+      return readJsonResponse(response)
+    }
+
+    async function postClearInactive(sessionId, signal) {
+      const response = await fetch(ROUTE + '/clear-inactive', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
         signal,
       })
       return readJsonResponse(response)
@@ -870,7 +941,14 @@ window.__ModuleLoader__.load({
       const selected = props.selected === true
       const tone = record.error != null && record.status == null ? 'error' : statusTone(record.status)
       const pending = isPending(record)
-      const sizeText = pending ? '—' : formatBytes(record.responseBytes)
+      const requestSize = formatBytes(record.requestBytes)
+      const responseSize = formatBytes(record.responseBytes)
+      const sizeText = pending && (Number(record.requestBytes) || 0) === 0
+        ? '—'
+        : t('row.sizePair', {
+          request: requestSize,
+          response: pending ? '—' : responseSize,
+        })
       const modelLine = typeof record.model === 'string' && record.model.length > 0
         ? '\n' + t('detail.model') + ': ' + record.model
         : ''
@@ -897,7 +975,7 @@ window.__ModuleLoader__.load({
           h('span', { className: statusChipClass(tone) }, statusLabelOf(record, t))),
         h('span', { className: 'shl-row-meta' },
           h('span', { title: t('detail.duration') }, formatDuration(record.durationMs)),
-          h('span', { title: t('detail.responseSize') }, sizeText),
+          h('span', { title: t('row.sizeTooltip', { request: requestSize, response: responseSize }) }, sizeText),
           h('span', { title: t('detail.started') }, formatClock(record.startedAt))))
     }
 
@@ -930,6 +1008,7 @@ window.__ModuleLoader__.load({
       const statusText = statusLabelOf(record, t)
       const requestSize = formatBytes(record.requestBytes)
       const responseSize = formatBytes(record.responseBytes)
+      const totalSize = formatBytes((Number(record.requestBytes) || 0) + (Number(record.responseBytes) || 0))
       const recordVersion = [
         record.id,
         record.status,
@@ -964,6 +1043,7 @@ window.__ModuleLoader__.load({
               : null,
             h(OverviewRow, { key: 'requestSize', label: t('detail.requestSize') }, requestSize),
             h(OverviewRow, { key: 'responseSize', label: t('detail.responseSize') }, responseSize),
+            h(OverviewRow, { key: 'totalSize', label: t('detail.totalSize') }, totalSize),
             mimeEssence(record.responseMimeType) !== ''
               ? h(OverviewRow, { key: 'contentType', label: t('detail.contentType') }, mimeEssence(record.responseMimeType))
               : null)),
@@ -1129,6 +1209,88 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 所有会话抓包文件的磁盘总大小，以及其中不活跃会话的占用。独立于列表
+     * 轮询：扫描目录比拉列表贵，所以自动刷新时放慢到 8 秒一次；手动刷新、
+     * 清空、清空全部、清空不活跃后立即重取。面板不可见时不轮询；失败时
+     * 静默保留上次结果（这只是展示数字）。
+     * @param {string} sessionId - 面板正在查看的会话（永不归入不活跃）。
+     * @param {boolean} active - 面板是否可见。
+     * @param {boolean} autoRefresh - 是否随面板自动刷新。
+     * @param {number} refreshKey - 递增该值可立即重取。
+     * @returns {{bytes: number, files: number, sessions: number, dir: string, persist: boolean, maxTotalBytes: number, inactiveAvailable: boolean, inactiveBytes: number, inactiveFiles: number, inactiveSessions: number, loaded: boolean}}
+     */
+    function useUsage(sessionId, active, autoRefresh, refreshKey) {
+      const [usage, setUsage] = React.useState({
+        bytes: 0,
+        files: 0,
+        sessions: 0,
+        dir: '',
+        persist: false,
+        maxTotalBytes: 0,
+        inactiveAvailable: false,
+        inactiveBytes: 0,
+        inactiveFiles: 0,
+        inactiveSessions: 0,
+        loaded: false,
+      })
+
+      React.useEffect(() => {
+        if (active !== true) return undefined
+        const controller = new AbortController()
+        let cancelled = false
+        let busy = false
+        let timer = null
+        const isHidden = () =>
+          typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        const stopTimer = () => {
+          if (timer != null) {
+            window.clearInterval(timer)
+            timer = null
+          }
+        }
+        const startTimer = () => {
+          if (autoRefresh && timer == null && !isHidden()) timer = window.setInterval(tick, USAGE_POLL_INTERVAL_MS)
+        }
+        const tick = async () => {
+          if (busy || cancelled || isHidden()) return
+          busy = true
+          try {
+            const snapshot = await fetchUsage(sessionId, controller.signal)
+            if (!cancelled) setUsage({ ...snapshot, loaded: true })
+          } catch (caught) {
+            // 总大小仅用于展示：失败时保留上一次结果，错误由列表区域统一提示。
+            if (cancelled || isAbortError(caught)) return
+          } finally {
+            busy = false
+          }
+        }
+        const onVisibilityChange = () => {
+          if (isHidden()) {
+            stopTimer()
+          } else {
+            void tick()
+            startTimer()
+          }
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisibilityChange)
+        }
+        void tick()
+        startTimer()
+        return () => {
+          cancelled = true
+          stopTimer()
+          if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', onVisibilityChange)
+          }
+          controller.abort()
+        }
+      }, [sessionId, active, autoRefresh, refreshKey])
+
+      return usage
+    }
+
     function useDetail(sessionId, recordId, pollWhilePending) {
       const [record, setRecord] = React.useState(null)
       const [loading, setLoading] = React.useState(false)
@@ -1251,8 +1413,10 @@ window.__ModuleLoader__.load({
       const [selectedId, setSelectedId] = React.useState(null)
       const [confirmClear, setConfirmClear] = React.useState(false)
       const [confirmClearAll, setConfirmClearAll] = React.useState(false)
+      const [confirmClearInactive, setConfirmClearInactive] = React.useState(false)
       const [clearing, setClearing] = React.useState(false)
       const [clearingAll, setClearingAll] = React.useState(false)
+      const [clearingInactive, setClearingInactive] = React.useState(false)
       const [exporting, setExporting] = React.useState(false)
       const [revealing, setRevealing] = React.useState(false)
       const [revealFeedback, setRevealFeedback] = React.useState('idle')
@@ -1282,6 +1446,8 @@ window.__ModuleLoader__.load({
       }, [])
 
       const feed = useFeed(sessionId, autoRefresh, active)
+      const [usageNonce, setUsageNonce] = React.useState(0)
+      const usage = useUsage(sessionId, active, autoRefresh, usageNonce)
 
       const selectedSummary = React.useMemo(
         () => feed.records.find((record) => record.id === selectedId) || null,
@@ -1337,9 +1503,33 @@ window.__ModuleLoader__.load({
       const spaceTooltip = showSpace
         ? t('header.spaceTooltip', {
           memory: memoryText,
+          memoryLimit: formatBytes(feed.maxTurnBytes),
           disk: feed.fileBytes != null ? formatBytes(feed.fileBytes) : t('header.notPersisted'),
+          fileLimit: formatBytes(feed.maxLogFileBytes),
           dir: feed.dir !== '' ? feed.dir : '—',
         }) + '\n' + t('header.spaceUninstallNote')
+        : undefined
+
+      // 所有会话的磁盘占用（“清空全部”旁边的数字）；未持久化时隐藏。
+      const showAllSessions = usage.loaded && usage.persist
+      const allSessionsTooltip = showAllSessions
+        ? t('header.allSessionsTooltip', {
+          size: formatBytes(usage.bytes),
+          files: String(usage.files),
+          sessions: String(usage.sessions),
+          limit: usage.maxTotalBytes > 0 ? formatBytes(usage.maxTotalBytes) : t('header.noLimit'),
+          dir: usage.dir !== '' ? usage.dir : '—',
+        })
+        : undefined
+
+      // “清空不活跃”：删除已归档或已删除会话的抓包（所有工作区）。
+      const showInactiveClear = usage.loaded && usage.persist && usage.inactiveAvailable
+      const inactiveSizeText = formatBytes(usage.inactiveBytes)
+      const clearInactiveTitle = showInactiveClear
+        ? t('header.clearInactiveTitle', {
+          files: String(usage.inactiveFiles),
+          sessions: String(usage.inactiveSessions),
+        })
         : undefined
 
       const langSwitchLabel = props.lang === 'zh' ? t('lang.switchToEnglish') : t('lang.switchToChinese')
@@ -1367,6 +1557,8 @@ window.__ModuleLoader__.load({
       const handleRefresh = () => {
         setActionError(null)
         feed.refresh()
+        // 刷新时一并重取所有会话的总大小。
+        setUsageNonce((value) => value + 1)
         // 详情是独立请求；手动刷新不应让它保持陈旧。
         if (selectedId != null) detail.retry()
       }
@@ -1379,6 +1571,7 @@ window.__ModuleLoader__.load({
           setConfirmClear(false)
           setSelectedId(null)
           feed.refresh()
+          setUsageNonce((value) => value + 1)
         } catch (caught) {
           setActionError(t('error.clear', { message: errorMessage(caught) }))
         } finally {
@@ -1394,10 +1587,26 @@ window.__ModuleLoader__.load({
           setConfirmClearAll(false)
           setSelectedId(null)
           feed.refresh()
+          setUsageNonce((value) => value + 1)
         } catch (caught) {
           setActionError(t('error.clearAll', { message: errorMessage(caught) }))
         } finally {
           setClearingAll(false)
+        }
+      }
+
+      const handleClearInactive = async () => {
+        setClearingInactive(true)
+        setActionError(null)
+        try {
+          await postClearInactive(sessionId)
+          setConfirmClearInactive(false)
+          feed.refresh()
+          setUsageNonce((value) => value + 1)
+        } catch (caught) {
+          setActionError(t('error.clearInactive', { message: errorMessage(caught) }))
+        } finally {
+          setClearingInactive(false)
         }
       }
 
@@ -1487,10 +1696,35 @@ window.__ModuleLoader__.load({
               ? h('span', { className: 'shl-space', title: spaceTooltip }, t('header.space', { memory: memoryText }))
               : null,
             h('div', { className: 'shl-title-actions' },
+              showAllSessions
+                ? h('span', {
+                  className: 'shl-all-size',
+                  title: allSessionsTooltip,
+                }, t('header.allSessions', { size: formatBytes(usage.bytes) }))
+                : null,
+              showInactiveClear
+                ? h('button', {
+                  type: 'button',
+                  className: 'shl-btn shl-btn-ghost shl-global-clear',
+                  onClick: () => {
+                    setConfirmClear(false)
+                    setConfirmClearAll(false)
+                    setConfirmClearInactive((value) => !value)
+                  },
+                  'aria-expanded': confirmClearInactive,
+                  title: clearInactiveTitle,
+                  'aria-label': t('header.clearInactive', { size: inactiveSizeText }),
+                  disabled: usage.inactiveBytes === 0 || clearingInactive,
+                }, t('header.clearInactive', { size: inactiveSizeText }))
+                : null,
               h('button', {
                 type: 'button',
                 className: 'shl-btn shl-btn-ghost shl-global-clear',
-                onClick: () => { setConfirmClear(false); setConfirmClearAll((value) => !value) },
+                onClick: () => {
+                  setConfirmClear(false)
+                  setConfirmClearInactive(false)
+                  setConfirmClearAll((value) => !value)
+                },
                 'aria-expanded': confirmClearAll,
                 title: t('header.clearAllTitle'),
                 'aria-label': t('header.clearAllTitle'),
@@ -1515,7 +1749,11 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               className: 'shl-btn',
-              onClick: () => { setConfirmClearAll(false); setConfirmClear((value) => !value) },
+              onClick: () => {
+                setConfirmClearAll(false)
+                setConfirmClearInactive(false)
+                setConfirmClear((value) => !value)
+              },
               'aria-expanded': confirmClear,
             }, t('header.clear')),
             h('button', { type: 'button', className: 'shl-btn', onClick: handleExport, disabled: exporting },
@@ -1552,6 +1790,18 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClearAll, disabled: clearingAll },
                 clearingAll ? t('header.clearingAll') : t('header.clearAllConfirmYes')),
               h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClearAll(false), disabled: clearingAll },
+                t('header.cancel')))
+            : null,
+          confirmClearInactive
+            ? h('div', { className: 'shl-banner' },
+              h('span', { className: 'shl-banner-text' }, t('header.clearInactiveConfirm', {
+                size: inactiveSizeText,
+                sessions: String(usage.inactiveSessions),
+                files: String(usage.inactiveFiles),
+              })),
+              h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClearInactive, disabled: clearingInactive },
+                clearingInactive ? t('header.clearingInactive') : t('header.clearInactiveConfirmYes')),
+              h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClearInactive(false), disabled: clearingInactive },
                 t('header.cancel')))
             : null,
           actionError != null

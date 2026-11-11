@@ -26,6 +26,8 @@ const warnings = []
 let knownSessionIds = new Set(['session-test', 'session-evict', 'session-marker'])
 let sessionParents = new Map()
 const workspaceRegistry = { archivedSessionIds: [] }
+/** Sessions the fake Host currently considers live. */
+const liveSessions = []
 
 const connectionFace = {
   fetch: {
@@ -60,7 +62,7 @@ const fakeCtx = {
       }
     }
     if (name === 'workspaceRegistry') return workspaceRegistry
-    if (name === 'sessions') return { list: () => [] }
+    if (name === 'sessions') return { list: () => liveSessions.map((id) => ({ id })) }
     return undefined
   },
   connection: connectionFace,
@@ -117,6 +119,19 @@ const server = createServer(async (req, res) => {
     }, 10)
     return
   }
+  if (req.url.startsWith('/v1/messages')) {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n')
+    setTimeout(() => {
+      if (!res.writableEnded && !res.destroyed) {
+        res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+      }
+    }, 10)
+    setTimeout(() => {
+      if (!res.writableEnded) res.end()
+    }, 250)
+    return
+  }
   if (req.url.startsWith('/json')) {
     const body = JSON.stringify({ ok: true, echo: req.rawBody })
     res.writeHead(201, { 'content-type': 'application/json; charset=utf-8' })
@@ -143,7 +158,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 // ── install the plugin under test ───────────────────────────────────────────
 apply(fakeCtx, config)
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed')
-assert.equal(routes.size, 6, `expected 6 routes, got ${[...routes.keys()].join(', ')}`)
+assert.equal(routes.size, 8, `expected 8 routes, got ${[...routes.keys()].join(', ')}`)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const route = (path) => {
@@ -214,10 +229,20 @@ assert.ok(feed.totalBytes > 0, 'session total stored bytes reported')
 assert.equal(feed.fileBytes, null, 'no persisted file size when persistence is off')
 assert.equal(feed.dir, dataDir, 'data directory reported')
 assert.equal(feed.persist, false, 'persistence flag reported')
-assert.equal(feed.maxLogFileBytes, 8 * 1024 * 1024, 'per-turn disk cap reported')
+assert.equal(feed.maxLogFileBytes, 32 * 1024 * 1024, 'per-turn disk cap reported')
 assert.equal(feed.latestTurnOnly, true, 'latest-turn retention reported')
 assert.equal(feed.retentionMs, 24 * 60 * 60 * 1000, 'retention window reported')
 assert.equal(typeof feed.maxTotalBytes, 'number', 'global disk cap reported')
+
+// 1a. aggregate disk usage across sessions; nothing on disk when persistence is off.
+const usageOff = await callRoute('/api/dsh-plugin-session-http-log/usage')
+assert.equal(usageOff.status, 200, 'usage route responds')
+assert.equal(usageOff.json.persist, false, 'usage reports persistence flag')
+assert.equal(usageOff.json.bytes, 0, 'no aggregate usage when persistence is off')
+assert.equal(usageOff.json.files, 0, 'no capture files counted when persistence is off')
+assert.equal(usageOff.json.dir, dataDir, 'usage reports the data directory')
+assert.equal(usageOff.json.inactiveAvailable, true, 'inactive usage is measurable when the session list is available')
+assert.equal(usageOff.json.inactiveBytes, 0, 'no inactive usage when persistence is off')
 const feedEtag = feedResponse.headers.get('etag')
 assert.ok(typeof feedEtag === 'string' && feedEtag.length > 0, 'records response has an ETag')
 const notModified = await callRoute('/api/dsh-plugin-session-http-log/records', {
@@ -256,6 +281,41 @@ const responseBodyPart = (await callRoute('/api/dsh-plugin-session-http-log/reco
   query: `?sessionId=session-test&id=${summary.id}&part=responseBody`,
 })).json.part
 assert.ok(responseBodyPart.body.includes('data: [DONE]'), 'response body part loads only that body')
+
+// 1b. The model adapter aborts the request right after message_stop. The clone
+// reader then fails with AbortError even though the captured stream is complete;
+// that must not be reported as truncation.
+knownSessionIds.add('session-abort')
+initiator = { id: 'session-abort' }
+const abortController = new AbortController()
+const abortResponse = await globalThis.fetch(`${base}/v1/messages`, { signal: abortController.signal })
+const abortReader = abortResponse.body.getReader()
+const abortTextDecoder = new TextDecoder()
+let abortedStreamText = ''
+for (;;) {
+  const chunk = await abortReader.read()
+  if (chunk.done) break
+  abortedStreamText += abortTextDecoder.decode(chunk.value, { stream: true })
+  if (abortedStreamText.includes('message_stop')) {
+    abortController.abort()
+    break
+  }
+}
+const abortSummary = await waitFor(async () => {
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', {
+    query: '?sessionId=session-abort',
+  })
+  return result.json.records.find((candidate) => candidate.kind === 'llm')
+}, 'captured caller-aborted SSE record')
+assert.equal(abortSummary.responseTruncated, false, 'caller abort after a complete SSE stream is not truncation')
+const abortDetail = await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: `?sessionId=session-abort&id=${abortSummary.id}`,
+})
+assert.ok(
+  abortDetail.json.record.responseBody.includes('message_stop'),
+  'completed SSE tail is preserved after the caller aborts',
+)
+initiator = { id: 'session-test' }
 
 // 2. JSON exchange + binary response + POST route with a body.
 await (await globalThis.fetch(`${base}/json`, {
@@ -438,6 +498,16 @@ await waitFor(async () => {
     return false
   }
 }, 'clear-all fixture files')
+const usageBefore = (await callRoute('/api/dsh-plugin-session-http-log/usage')).json
+assert.equal(usageBefore.persist, true, 'folder usage reports persistence')
+assert.equal(usageBefore.dir, markerDir, 'folder usage reports the data directory')
+assert.equal(usageBefore.maxTotalBytes, 512 * 1024 * 1024, 'folder usage reports the global cap')
+assert.ok(usageBefore.bytes > 0, 'folder usage sums every session capture file')
+assert.ok(usageBefore.files >= 2, `folder usage counts capture files (got ${usageBefore.files})`)
+assert.ok(usageBefore.sessions >= 2, `folder usage counts sessions (got ${usageBefore.sessions})`)
+assert.equal(usageBefore.inactiveAvailable, true, 'inactive usage available')
+assert.equal(usageBefore.inactiveSessions, 0, 'known sessions are not inactive')
+assert.equal(usageBefore.inactiveBytes, 0, 'no inactive bytes while every session still exists')
 const [clearedAll, clearedAllAgain] = await Promise.all([
   callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
   callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
@@ -459,11 +529,95 @@ for (const id of ['session-marker', 'session-marker-other']) {
 await access(markerPath)
 await access(markerKeep)
 assert.equal((await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-marker' })).json.total, 0)
+// clear-all empties the aggregate while README.txt and unknown files stay.
+const usageAfter = (await callRoute('/api/dsh-plugin-session-http-log/usage')).json
+assert.equal(usageAfter.bytes, 0, 'clear-all empties the aggregate disk usage')
+assert.equal(usageAfter.files, 0, 'clear-all removes every counted capture file')
+assert.equal(usageAfter.sessions, 0, 'clear-all leaves no counted sessions')
 
 for (const cleanup of cleanups.splice(0)) cleanup()
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after marker run')
 assert.equal(routes.size, 0, 'routes removed after marker run')
 await rm(markerDir, { recursive: true, force: true })
+
+// 9b-2. clear-inactive deletes only archived or deleted session captures
+// (globally, across workspaces) and always keeps the viewed session.
+const inactiveDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-inactive-'))
+knownSessionIds.add('session-view')
+knownSessionIds.add('session-archived-log')
+workspaceRegistry.archivedSessionIds = ['session-archived-log']
+liveSessions.length = 0
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: inactiveDir,
+  cleanupLogs: false,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for inactive run')
+for (const [sessionId, body] of [
+  ['session-view', '{"inactive":"view"}'],
+  ['session-archived-log', '{"inactive":"archived"}'],
+  ['session-gone-log', '{"inactive":"gone"}'],
+]) {
+  initiator = { id: sessionId }
+  await (await globalThis.fetch(`${base}/json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })).text()
+}
+await waitFor(async () => {
+  try {
+    for (const id of ['session-view', 'session-archived-log', 'session-gone-log']) {
+      await access(join(inactiveDir, `${id}.jsonl`))
+    }
+    return true
+  } catch {
+    return false
+  }
+}, 'inactive fixture files')
+
+const usageInactive = (await callRoute('/api/dsh-plugin-session-http-log/usage', {
+  query: '?sessionId=session-view',
+})).json
+assert.equal(usageInactive.inactiveAvailable, true, 'inactive usage available')
+assert.equal(usageInactive.inactiveSessions, 2, 'archived and deleted sessions are inactive')
+assert.ok(usageInactive.inactiveBytes > 0, 'inactive usage counts archived/deleted session files')
+assert.ok(usageInactive.inactiveBytes < usageInactive.bytes, 'inactive usage stays below the total')
+
+const clearedInactive = (await callRoute('/api/dsh-plugin-session-http-log/clear-inactive', {
+  method: 'POST',
+  body: { sessionId: 'session-view' },
+})).json
+assert.equal(clearedInactive.ok, true, 'clear-inactive reports success')
+assert.equal(clearedInactive.removedSessions, 2, 'clear-inactive removes archived and deleted sessions')
+assert.ok(clearedInactive.removedFiles >= 2, 'clear-inactive counts removed files')
+assert.ok(clearedInactive.freedBytes > 0, 'clear-inactive reports freed bytes')
+await access(join(inactiveDir, 'session-view.jsonl'))
+await access(join(inactiveDir, 'session-view.jsonl.idx'))
+for (const removed of ['session-archived-log', 'session-gone-log']) {
+  try {
+    await access(join(inactiveDir, `${removed}.jsonl`))
+    assert.fail(`${removed} capture file should be deleted by clear-inactive`)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+}
+const usageAfterInactive = (await callRoute('/api/dsh-plugin-session-http-log/usage', {
+  query: '?sessionId=session-view',
+})).json
+assert.equal(usageAfterInactive.inactiveSessions, 0, 'no inactive sessions remain')
+assert.equal(usageAfterInactive.inactiveBytes, 0, 'no inactive bytes remain')
+assert.ok(usageAfterInactive.bytes > 0, 'the viewed session capture stays on disk')
+assert.ok(usageAfterInactive.files < usageInactive.files, 'usage file count drops after clear-inactive')
+assert.ok(usageAfterInactive.files >= 2, 'the viewed session capture and index remain counted')
+
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after inactive run')
+assert.equal(routes.size, 0, 'routes removed after inactive run')
+workspaceRegistry.archivedSessionIds = []
+liveSessions.length = 0
+await rm(inactiveDir, { recursive: true, force: true })
 
 // 9c. cold list reads the lightweight index; detail is loaded lazily by offset.
 const lazyDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-lazy-'))
@@ -696,6 +850,9 @@ const ttlExpired = join(ttlDir, 'session-expired.jsonl')
 const ttlFresh = join(ttlDir, 'session-fresh.jsonl')
 await writeFile(ttlExpired, '{}\n', 'utf8')
 await writeFile(ttlFresh, '{}\n', 'utf8')
+await writeFile(`${ttlFresh}.idx`, '{"id":1}\n', 'utf8')
+// Orphan index without a body must be reclaimed; a paired index must survive.
+await writeFile(join(ttlDir, 'session-orphan.jsonl.idx'), '{"id":1}\n', 'utf8')
 const oldMtime = new Date(Date.now() - 60 * 60 * 1000)
 const freshAtime = new Date()
 await utimes(ttlExpired, freshAtime, oldMtime)
@@ -717,6 +874,13 @@ await waitFor(async () => {
   }
 }, 'expired capture cleanup')
 await access(ttlFresh)
+await access(`${ttlFresh}.idx`)
+try {
+  await access(join(ttlDir, 'session-orphan.jsonl.idx'))
+  assert.fail('orphan index without a body should be removed by cleanup')
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error
+}
 for (const cleanup of cleanups.splice(0)) cleanup()
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after TTL run')
 assert.equal(routes.size, 0, 'routes removed after TTL run')
