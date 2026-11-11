@@ -39,10 +39,15 @@ window.__ModuleLoader__.load({
       'header.autoRefresh': 'Auto refresh',
       'header.refresh': 'Refresh',
       'header.clear': 'Clear',
+      'header.clearAll': 'Clear all',
+      'header.clearAllTitle': 'Clear all session HTTP logs',
       'header.clearConfirm': 'Clear every captured exchange for this session?',
+      'header.clearAllConfirm': 'Delete the HTTP capture files for ALL sessions? This cannot be undone.',
       'header.clearConfirmYes': 'Confirm clear',
+      'header.clearAllConfirmYes': 'Delete all captures',
       'header.cancel': 'Cancel',
       'header.clearing': 'Clearing…',
+      'header.clearingAll': 'Clearing all…',
       'header.export': 'Export HAR',
       'header.exporting': 'Exporting…',
       'filter.placeholder': 'Filter by method, URL, status or model',
@@ -55,6 +60,8 @@ window.__ModuleLoader__.load({
       'row.error': 'error',
       'detail.selectHint': 'Select a request to inspect its raw exchange.',
       'detail.loading': 'Loading record…',
+      'detail.bodyLoading': 'Loading body…',
+      'detail.bodyError': 'Could not load body: {message}',
       'detail.error': 'Could not load record: {message}',
       'detail.overview': 'Overview',
       'detail.requestHeaders': 'Request headers',
@@ -100,8 +107,8 @@ window.__ModuleLoader__.load({
       'section.collapse': 'Collapse section',
       'header.space': '{memory} occupied',
       'header.spaceTooltip': 'Memory estimate: {memory}\nOn disk: {disk}\nDirectory: {dir}',
-      'header.retention': 'Disk cap for this session: {limit}. When reached, only the most recent records are kept.',
-      'header.retentionTitle': 'Only this session\'s JSONL is rewritten with a recent tail. Other sessions are never touched, and the list already loaded in this panel stays available until refresh.',
+      'header.retention': 'Only the latest turn is kept. Turn file cap: {limit}; captures not updated for {hours}h are cleaned up automatically.',
+      'header.retentionTitle': 'A new turn clears the previous turn for this session. The turn file is capped, and idle files expire on the daily cleanup. Other sessions are handled independently; the Open folder and Clear actions remain available.',
       'header.spaceUninstallNote': 'Uninstalling the plugin does not delete this directory.',
       'header.notPersisted': 'not persisted',
       'header.openFolder': 'Open folder',
@@ -111,6 +118,7 @@ window.__ModuleLoader__.load({
       'error.reveal': 'Could not open the data directory: {message}',
       'error.export': 'HAR export failed: {message}',
       'error.clear': 'Clear failed: {message}',
+      'error.clearAll': 'Could not clear all captures: {message}',
     }
     const zh = {
       'tab.title': '会话 HTTP 记录',
@@ -121,10 +129,15 @@ window.__ModuleLoader__.load({
       'header.autoRefresh': '自动刷新',
       'header.refresh': '刷新',
       'header.clear': '清空',
+      'header.clearAll': '清空全部',
+      'header.clearAllTitle': '清空所有会话 HTTP 记录',
       'header.clearConfirm': '确定清空当前会话的全部记录？',
+      'header.clearAllConfirm': '确定删除所有会话的 HTTP 抓包文件？此操作不可恢复。',
       'header.clearConfirmYes': '确认清空',
+      'header.clearAllConfirmYes': '清空全部记录',
       'header.cancel': '取消',
       'header.clearing': '清空中…',
+      'header.clearingAll': '正在清空全部…',
       'header.export': '导出 HAR',
       'header.exporting': '导出中…',
       'filter.placeholder': '按方法、URL、状态或模型筛选',
@@ -137,6 +150,8 @@ window.__ModuleLoader__.load({
       'row.error': '错误',
       'detail.selectHint': '选择一条请求以查看原始报文。',
       'detail.loading': '正在加载记录…',
+      'detail.bodyLoading': '正在加载报文…',
+      'detail.bodyError': '加载报文失败：{message}',
       'detail.error': '加载记录失败：{message}',
       'detail.overview': '概览',
       'detail.requestHeaders': '请求头',
@@ -182,8 +197,8 @@ window.__ModuleLoader__.load({
       'section.collapse': '收起此区块',
       'header.space': '占用 {memory}',
       'header.spaceTooltip': '内存估算：{memory}\n磁盘：{disk}\n目录：{dir}',
-      'header.retention': '单会话磁盘上限 {limit}：达到上限后只保留最近记录。',
-      'header.retentionTitle': '只会重写当前会话的 JSONL 并保留最近记录，绝不影响其它会话；当前面板已加载的列表也会保留，直到刷新。',
+      'header.retention': '仅保留最新一轮：单轮文件上限 {limit}；超过 {hours} 小时未更新会自动清理。',
+      'header.retentionTitle': '同一会话进入新一轮时会清空上一轮记录；单轮文件达到上限时只保留最近记录。每日清理会删除过期及已归档/已删除会话的文件；其它会话独立处理。打开目录与清空功能始终保留。',
       'header.spaceUninstallNote': '卸载插件不会删除该目录。',
       'header.notPersisted': '未持久化',
       'header.openFolder': '打开目录',
@@ -193,6 +208,7 @@ window.__ModuleLoader__.load({
       'error.reveal': '打开数据目录失败：{message}',
       'error.export': '导出 HAR 失败：{message}',
       'error.clear': '清空失败：{message}',
+      'error.clearAll': '清空全部抓包失败：{message}',
     }
 
     // ---------------------------------------------------------------------
@@ -203,7 +219,11 @@ window.__ModuleLoader__.load({
       '.shl-root{display:flex;flex-direction:column;flex:1 1 auto;min-width:0;min-height:0;height:100%;box-sizing:border-box;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.45}',
       '.shl-root *,.shl-root *::before,.shl-root *::after{box-sizing:border-box}',
       '.shl-header{display:flex;flex-direction:column;gap:6px;padding:8px 10px 7px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);min-width:0}',
-      '.shl-title-row{display:flex;align-items:baseline;gap:8px;min-width:0}',
+      '.shl-title-row{display:flex;align-items:center;gap:8px;min-width:0}',
+      '.shl-title-actions{margin-left:auto;display:flex;align-items:center;gap:6px;flex:0 0 auto}',
+      '.shl-global-clear{color:var(--dsw-alias-label-secondary);border-color:transparent;background:transparent;padding:1px 6px;font-size:11px}',
+      '.shl-global-clear:hover{color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-overlay)}',
+      '.shl-global-clear:focus-visible{outline:2px solid var(--dsw-alias-state-error-primary);outline-offset:1px}',
       '.shl-title{flex:0 1 auto;min-width:0;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.shl-count{flex:0 0 auto;color:var(--dsw-alias-label-secondary);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}',
       '.shl-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}',
@@ -329,6 +349,12 @@ window.__ModuleLoader__.load({
       const kb = bytes / 1024
       if (kb < 1024) return kb.toFixed(kb < 10 ? 1 : 0) + ' KB'
       return (kb / 1024).toFixed(1) + ' MB'
+    }
+
+    /** 把毫秒保留时长格式化为 UI 使用的整小时数。 */
+    function formatRetentionHours(ms) {
+      if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '24'
+      return String(Math.max(1, Math.round(ms / (60 * 60 * 1000))))
     }
 
     /** URL 末尾的路径片段，用于紧凑的列表行。 */
@@ -511,10 +537,11 @@ window.__ModuleLoader__.load({
       return ROUTE + '/records?' + query.toString()
     }
 
-    function recordUrl(sessionId, id) {
+    function recordUrl(sessionId, id, part) {
       const query = new URLSearchParams()
       query.set('sessionId', sessionId)
       query.set('id', String(id))
+      if (typeof part === 'string' && part !== '') query.set('part', part)
       return ROUTE + '/record?' + query.toString()
     }
 
@@ -542,15 +569,19 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    async function fetchRecords(sessionId, signal) {
+    async function fetchRecords(sessionId, signal, etag) {
+      const headers = { accept: 'application/json' }
+      if (typeof etag === 'string' && etag !== '') headers['if-none-match'] = etag
       const response = await fetch(recordsUrl(sessionId), {
         method: 'GET',
         credentials: 'same-origin',
-        headers: { accept: 'application/json' },
+        headers,
         signal,
       })
+      if (response.status === 304) return null
       const payload = await readJsonResponse(response)
       return {
+        etag: typeof response.headers.get('etag') === 'string' ? response.headers.get('etag') : '',
         records: Array.isArray(payload.records) ? payload.records : [],
         total: typeof payload.total === 'number' ? payload.total : 0,
         totalBytes: typeof payload.totalBytes === 'number' && isFinite(payload.totalBytes) ? payload.totalBytes : 0,
@@ -560,11 +591,14 @@ window.__ModuleLoader__.load({
         maxLogFileBytes: typeof payload.maxLogFileBytes === 'number' && isFinite(payload.maxLogFileBytes) && payload.maxLogFileBytes > 0
           ? payload.maxLogFileBytes
           : 0,
+        retentionMs: typeof payload.retentionMs === 'number' && isFinite(payload.retentionMs) && payload.retentionMs > 0
+          ? payload.retentionMs
+          : 24 * 60 * 60 * 1000,
       }
     }
 
-    async function fetchRecord(sessionId, id, signal) {
-      const response = await fetch(recordUrl(sessionId, id), {
+    async function fetchRecord(sessionId, id, signal, part = 'meta') {
+      const response = await fetch(recordUrl(sessionId, id, part), {
         method: 'GET',
         credentials: 'same-origin',
         headers: { accept: 'application/json' },
@@ -575,12 +609,35 @@ window.__ModuleLoader__.load({
       return payload.record
     }
 
+    async function fetchRecordBody(sessionId, id, side, signal) {
+      const part = side === 'request' ? 'requestBody' : 'responseBody'
+      const response = await fetch(recordUrl(sessionId, id, part), {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json' },
+        signal,
+      })
+      const payload = await readJsonResponse(response)
+      if (payload.part == null || typeof payload.part !== 'object') throw new Error('Malformed record body response')
+      return payload.part
+    }
+
     async function postClear(sessionId, signal) {
       const response = await fetch(ROUTE + '/clear', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { accept: 'application/json', 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId }),
+        signal,
+      })
+      return readJsonResponse(response)
+    }
+
+    async function postClearAll(signal) {
+      const response = await fetch(ROUTE + '/clear-all', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json' },
         signal,
       })
       return readJsonResponse(response)
@@ -654,10 +711,10 @@ window.__ModuleLoader__.load({
       }))
     }
 
-    /** 头部可切换正文的详情区块；默认展开。 */
+    /** 头部可切换正文的详情区块；可通过 defaultExpanded 控制初始状态。 */
     function DetailSection(props) {
       const t = props.t
-      const [expanded, setExpanded] = React.useState(true)
+      const [expanded, setExpanded] = React.useState(props.defaultExpanded !== false)
       const action = expanded ? t('section.collapse') : t('section.expand')
       const tools = props.tools
       const hasTools = tools != null && (!Array.isArray(tools) || tools.length > 0)
@@ -686,7 +743,7 @@ window.__ModuleLoader__.load({
       if (headers.length > 0) {
         tools.push(h(CopyButton, { key: 'copy-headers', getText: () => headersToText(headers), label: t('action.copyHeaders'), t }))
       }
-      return h(DetailSection, { title: props.title, t, tools },
+      return h(DetailSection, { title: props.title, t, tools, defaultExpanded: props.defaultExpanded === true },
         headers.length === 0
           ? h('div', { className: 'shl-muted' }, t('detail.noHeaders'))
           : h('div', { className: 'shl-kv-wrap' },
@@ -696,29 +753,88 @@ window.__ModuleLoader__.load({
                 h('td', null, String(pair[1]))))))))
     }
 
-    /** 单条捕获的报文：默认原始内容，可选格式化 JSON 视图。 */
+    /** 展开后才挂载的 body 内容；挂载时按需请求，避免详情首屏携带大报文。 */
+    function BodyContent(props) {
+      const t = props.t
+      const [error, setError] = React.useState(null)
+      const [loading, setLoading] = React.useState(false)
+      const [nonce, setNonce] = React.useState(0)
+      const loadRef = React.useRef(props.loadBody)
+      loadRef.current = props.loadBody
+
+      React.useEffect(() => {
+        if (props.part != null || typeof props.body === 'string' || typeof loadRef.current !== 'function') return undefined
+        const controller = new AbortController()
+        let cancelled = false
+        setLoading(true)
+        setError(null)
+        Promise.resolve(loadRef.current(controller.signal)).then(
+          (part) => {
+            if (cancelled) return
+            props.onLoaded(part)
+            setLoading(false)
+          },
+          (caught) => {
+            if (cancelled || isAbortError(caught)) return
+            setError(errorMessage(caught))
+            setLoading(false)
+          },
+        )
+        return () => {
+          cancelled = true
+          controller.abort()
+        }
+      }, [props.recordId, props.side, props.version, nonce])
+
+      const text = typeof props.body === 'string'
+        ? props.body
+        : (props.part != null && typeof props.part.body === 'string' ? props.part.body : null)
+      if (loading) {
+        return h('div', { className: 'shl-state' }, h(Spinner, null), h('span', null, t('detail.bodyLoading')))
+      }
+      if (error != null) {
+        return h('div', { className: 'shl-state shl-state-error' },
+          h('span', null, t('detail.bodyError', { message: error })),
+          h('button', { type: 'button', className: 'shl-btn', onClick: () => setNonce((value) => value + 1) }, t('list.retry')))
+      }
+      if (props.part != null && typeof props.part.body !== 'string') {
+        return h('div', { className: 'shl-muted' }, t('detail.noBody'))
+      }
+      if (text == null && props.part == null) {
+        return h('div', { className: 'shl-state' }, h('span', null, t('detail.bodyLoading')))
+      }
+      return null
+    }
+
+    /** 单条捕获的报文：默认折叠，展开后才按需加载 body。 */
     function BodySection(props) {
       const t = props.t
-      const text = typeof props.body === 'string' ? props.body : null
-      const isBase64 = props.encoding === 'base64'
       const [pretty, setPretty] = React.useState(false)
+      const [part, setPart] = React.useState(null)
+      const staticBody = typeof props.body === 'string' ? props.body : null
+      const text = staticBody != null ? staticBody : (part != null && typeof part.body === 'string' ? part.body : null)
+      const encoding = part != null && typeof part.encoding === 'string' ? part.encoding : props.encoding
+      const truncated = part != null ? part.truncated === true : props.truncated === true
+      const mimeType = part != null && typeof part.mimeType === 'string' ? part.mimeType : props.mimeType
+      const isBase64 = encoding === 'base64'
 
       React.useEffect(() => {
         setPretty(false)
-      }, [props.recordId])
+        setPart(null)
+      }, [props.recordId, props.side, props.version])
 
       const prettyText = React.useMemo(() => {
         if (isBase64 || text == null) return null
-        if (!looksJson(text, props.mimeType)) return null
+        if (!looksJson(text, mimeType)) return null
         return tryPrettyJson(text)
-      }, [isBase64, text, props.mimeType])
+      }, [isBase64, text, mimeType])
 
       const shown = pretty && prettyText != null ? prettyText : text
-      const mime = mimeEssence(props.mimeType)
+      const mime = mimeEssence(mimeType)
       const badges = []
-      if (props.truncated === true) badges.push(h(Badge, { key: 'truncated', warn: true }, t('badge.truncated')))
+      if (truncated === true) badges.push(h(Badge, { key: 'truncated', warn: true }, t('badge.truncated')))
       if (isBase64) badges.push(h(Badge, { key: 'base64' }, t('badge.base64')))
-      if (mime !== '') badges.push(h(Badge, { key: 'mime', title: props.mimeType }, mime))
+      if (mime !== '') badges.push(h(Badge, { key: 'mime', title: mimeType }, mime))
       const tools = []
       if (prettyText != null) {
         tools.push(h('button', {
@@ -730,10 +846,20 @@ window.__ModuleLoader__.load({
         }, pretty ? t('detail.raw') : t('detail.pretty')))
       }
       if (text != null) tools.push(h(CopyButton, { key: 'copy-body', getText: () => text, label: t('action.copyBody'), t }))
-      return h(DetailSection, { title: props.title, t, badges, tools },
-        text == null
-          ? h('div', { key: 'body', className: 'shl-muted' }, t('detail.noBody'))
-          : h('pre', { key: 'body', className: 'shl-pre' }, shown),
+      return h(DetailSection, { title: props.title, t, badges, tools, defaultExpanded: false },
+        h(BodyContent, {
+          body: staticBody,
+          part,
+          recordId: props.recordId,
+          side: props.side,
+          version: props.version,
+          loadBody: props.loadBody,
+          onLoaded: setPart,
+          t,
+        }),
+        text != null && shown != null
+          ? h('pre', { key: 'body', className: 'shl-pre' }, shown)
+          : null,
         isBase64 ? h('div', { key: 'note', className: 'shl-muted' }, t('detail.base64Note')) : null)
     }
 
@@ -785,6 +911,7 @@ window.__ModuleLoader__.load({
     function RecordDetail(props) {
       const t = props.t
       const record = props.record
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
 
       if (record == null) {
         if (props.error != null) {
@@ -803,6 +930,13 @@ window.__ModuleLoader__.load({
       const statusText = statusLabelOf(record, t)
       const requestSize = formatBytes(record.requestBytes)
       const responseSize = formatBytes(record.responseBytes)
+      const recordVersion = [
+        record.id,
+        record.status,
+        record.completedAt,
+        record.requestBytes,
+        record.responseBytes,
+      ].join(':')
 
       return h(React.Fragment, null,
         props.error != null
@@ -848,20 +982,31 @@ window.__ModuleLoader__.load({
         h(BodySection, {
           title: t('detail.requestBody'),
           recordId: record.id,
-          body: record.requestBody,
+          side: 'request',
+          version: recordVersion,
+          body: typeof record.requestBody === 'string' ? record.requestBody : null,
           encoding: record.requestBodyEncoding,
           truncated: record.requestTruncated === true,
           mimeType: Array.isArray(record.requestHeaders) ? headerValue(record.requestHeaders, 'content-type') : '',
+          loadBody: (signal) => fetchRecordBody(sessionId, record.id, 'request', signal),
           t,
         }),
-        h(HeadersSection, { title: t('detail.responseHeaders'), headers: record.responseHeaders, t }),
+        h(HeadersSection, {
+          title: t('detail.responseHeaders'),
+          headers: record.responseHeaders,
+          defaultExpanded: false,
+          t,
+        }),
         h(BodySection, {
           title: t('detail.responseBody'),
           recordId: record.id,
-          body: record.responseBody,
+          side: 'response',
+          version: recordVersion,
+          body: typeof record.responseBody === 'string' ? record.responseBody : null,
           encoding: record.responseBodyEncoding,
           truncated: record.responseTruncated === true,
           mimeType: record.responseMimeType,
+          loadBody: (signal) => fetchRecordBody(sessionId, record.id, 'response', signal),
           t,
         }))
     }
@@ -878,7 +1023,7 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------------
     // 数据 Hook：挂载期间轮询，绝不重叠，卸载/切换时中止。
     // ---------------------------------------------------------------------
-    function useFeed(sessionId, autoRefresh) {
+    function useFeed(sessionId, autoRefresh, active) {
       const [records, setRecords] = React.useState([])
       const [total, setTotal] = React.useState(0)
       const [totalBytes, setTotalBytes] = React.useState(0)
@@ -886,26 +1031,48 @@ window.__ModuleLoader__.load({
       const [dir, setDir] = React.useState('')
       const [persist, setPersist] = React.useState(false)
       const [maxLogFileBytes, setMaxLogFileBytes] = React.useState(0)
+      const [retentionMs, setRetentionMs] = React.useState(24 * 60 * 60 * 1000)
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState(null)
       const [nonce, setNonce] = React.useState(0)
+      const etagRef = React.useRef('')
 
       React.useEffect(() => {
+        etagRef.current = ''
         if (sessionId === '') {
           setLoading(false)
           return undefined
         }
+        if (active !== true) {
+          setLoading(false)
+          return undefined
+        }
+        setLoading(true)
         const controller = new AbortController()
         let cancelled = false
         let busy = false
         let timer = null
+        etagRef.current = ''
+
+        const isHidden = () =>
+          typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        const stopTimer = () => {
+          if (timer != null) {
+            window.clearInterval(timer)
+            timer = null
+          }
+        }
+        const startTimer = () => {
+          if (autoRefresh && timer == null && !isHidden()) timer = window.setInterval(tick, POLL_INTERVAL_MS)
+        }
 
         const tick = async () => {
-          if (busy || cancelled) return
+          if (busy || cancelled || isHidden()) return
           busy = true
           try {
-            const snapshot = await fetchRecords(sessionId, controller.signal)
-            if (cancelled) return
+            const snapshot = await fetchRecords(sessionId, controller.signal, etagRef.current)
+            if (cancelled || snapshot === null) return
+            etagRef.current = snapshot.etag
             setRecords(snapshot.records)
             setTotal(snapshot.total)
             setTotalBytes(snapshot.totalBytes)
@@ -913,6 +1080,7 @@ window.__ModuleLoader__.load({
             setDir(snapshot.dir)
             setPersist(snapshot.persist)
             setMaxLogFileBytes(snapshot.maxLogFileBytes)
+            setRetentionMs(snapshot.retentionMs)
             setError(null)
           } catch (caught) {
             if (cancelled || isAbortError(caught)) return
@@ -923,14 +1091,28 @@ window.__ModuleLoader__.load({
           }
         }
 
-        tick()
-        if (autoRefresh) timer = window.setInterval(tick, POLL_INTERVAL_MS)
+        const onVisibilityChange = () => {
+          if (isHidden()) {
+            stopTimer()
+          } else {
+            void tick()
+            startTimer()
+          }
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisibilityChange)
+        }
+        void tick()
+        startTimer()
         return () => {
           cancelled = true
-          if (timer != null) window.clearInterval(timer)
+          stopTimer()
+          if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', onVisibilityChange)
+          }
           controller.abort()
         }
-      }, [sessionId, autoRefresh, nonce])
+      }, [sessionId, autoRefresh, active, nonce])
 
       return {
         records,
@@ -940,6 +1122,7 @@ window.__ModuleLoader__.load({
         dir,
         persist,
         maxLogFileBytes,
+        retentionMs,
         loading,
         error,
         refresh: () => setNonce((value) => value + 1),
@@ -972,11 +1155,23 @@ window.__ModuleLoader__.load({
         let busy = false
         let timer = null
 
+        const isHidden = () =>
+          typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        const stopTimer = () => {
+          if (timer != null) {
+            window.clearInterval(timer)
+            timer = null
+          }
+        }
+        const startTimer = () => {
+          if (pollWhilePending && timer == null && !isHidden()) timer = window.setInterval(tick, POLL_INTERVAL_MS)
+        }
+
         const tick = async () => {
-          if (busy || cancelled) return
+          if (busy || cancelled || isHidden()) return
           busy = true
           try {
-            const fetched = await fetchRecord(sessionId, recordId, controller.signal)
+            const fetched = await fetchRecord(sessionId, recordId, controller.signal, 'meta')
             if (cancelled) return
             setRecord(fetched)
             setError(null)
@@ -989,11 +1184,25 @@ window.__ModuleLoader__.load({
           }
         }
 
-        tick()
-        if (pollWhilePending) timer = window.setInterval(tick, POLL_INTERVAL_MS)
+        const onVisibilityChange = () => {
+          if (isHidden()) {
+            stopTimer()
+          } else {
+            void tick()
+            startTimer()
+          }
+        }
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisibilityChange)
+        }
+        void tick()
+        startTimer()
         return () => {
           cancelled = true
-          if (timer != null) window.clearInterval(timer)
+          stopTimer()
+          if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+            document.removeEventListener('visibilitychange', onVisibilityChange)
+          }
           controller.abort()
         }
       }, [sessionId, recordId, pollWhilePending, nonce])
@@ -1014,12 +1223,36 @@ window.__ModuleLoader__.load({
       const sessionId = props.sessionId
       // 'panel' = 右侧边栏（纵向布局）；'page' = 主区域标签页（横向宽布局）。
       const variant = props.variant === 'page' ? 'page' : 'panel'
+      const rootRef = React.useRef(null)
+      const [inViewport, setInViewport] = React.useState(true)
+      const [documentVisible, setDocumentVisible] = React.useState(
+        typeof document === 'undefined' || document.visibilityState !== 'hidden',
+      )
 
+      React.useEffect(() => {
+        if (typeof IntersectionObserver === 'undefined' || rootRef.current == null) return undefined
+        const observer = new IntersectionObserver((entries) => {
+          setInViewport(entries.some((entry) => entry.isIntersecting))
+        }, { threshold: 0 })
+        observer.observe(rootRef.current)
+        return () => observer.disconnect()
+      }, [])
+
+      React.useEffect(() => {
+        if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+        const update = () => setDocumentVisible(document.visibilityState !== 'hidden')
+        document.addEventListener('visibilitychange', update)
+        return () => document.removeEventListener('visibilitychange', update)
+      }, [])
+
+      const active = inViewport && documentVisible
       const [autoRefresh, setAutoRefresh] = React.useState(true)
       const [filter, setFilter] = React.useState('')
       const [selectedId, setSelectedId] = React.useState(null)
       const [confirmClear, setConfirmClear] = React.useState(false)
+      const [confirmClearAll, setConfirmClearAll] = React.useState(false)
       const [clearing, setClearing] = React.useState(false)
+      const [clearingAll, setClearingAll] = React.useState(false)
       const [exporting, setExporting] = React.useState(false)
       const [revealing, setRevealing] = React.useState(false)
       const [revealFeedback, setRevealFeedback] = React.useState('idle')
@@ -1048,14 +1281,14 @@ window.__ModuleLoader__.load({
         if (flashTimerRef.current != null) window.clearTimeout(flashTimerRef.current)
       }, [])
 
-      const feed = useFeed(sessionId, autoRefresh)
+      const feed = useFeed(sessionId, autoRefresh, active)
 
       const selectedSummary = React.useMemo(
         () => feed.records.find((record) => record.id === selectedId) || null,
         [feed.records, selectedId],
       )
       const pendingSelected = selectedSummary != null && isPending(selectedSummary)
-      const detail = useDetail(sessionId, selectedId, pendingSelected && autoRefresh)
+      const detail = useDetail(sessionId, active ? selectedId : null, pendingSelected && autoRefresh && active)
       const selectedRecord = detail.record != null && detail.record.id === selectedId ? detail.record : null
 
       // 选中记录变化时：把对应的列表行滚入视野，并让详情区域回到顶部。
@@ -1083,6 +1316,16 @@ window.__ModuleLoader__.load({
           : feed.records.filter((record) => matchesFilter(record, query))
         return matched.slice().reverse()
       }, [feed.records, filter])
+
+      // 页面/标签切换后不再渲染隐藏面板：详情正文组件卸载、请求被 abort，
+      // 只保留一个轻量根节点供 IntersectionObserver 检测重新可见。
+      if (!active) {
+        return h('div', {
+          className: variant === 'page' ? 'shl-root shl-page' : 'shl-root',
+          ref: rootRef,
+          'aria-hidden': 'true',
+        })
+      }
 
       const countLabel = filter.trim() !== ''
         ? t('header.filteredCount', { shown: String(filtered.length), total: String(feed.total) })
@@ -1140,6 +1383,21 @@ window.__ModuleLoader__.load({
           setActionError(t('error.clear', { message: errorMessage(caught) }))
         } finally {
           setClearing(false)
+        }
+      }
+
+      const handleClearAll = async () => {
+        setClearingAll(true)
+        setActionError(null)
+        try {
+          await postClearAll()
+          setConfirmClearAll(false)
+          setSelectedId(null)
+          feed.refresh()
+        } catch (caught) {
+          setActionError(t('error.clearAll', { message: errorMessage(caught) }))
+        } finally {
+          setClearingAll(false)
         }
       }
 
@@ -1214,7 +1472,10 @@ window.__ModuleLoader__.load({
         }))
       }
 
-      return h('div', { className: variant === 'page' ? 'shl-root shl-page' : 'shl-root' },
+      return h('div', {
+        className: variant === 'page' ? 'shl-root shl-page' : 'shl-root',
+        ref: rootRef,
+      },
         h('style', { key: 'styles' }, CSS),
         h('header', { className: 'shl-header' },
           h('div', { className: 'shl-title-row' },
@@ -1225,14 +1486,23 @@ window.__ModuleLoader__.load({
             showSpace
               ? h('span', { className: 'shl-space', title: spaceTooltip }, t('header.space', { memory: memoryText }))
               : null,
-            h('button', {
-              type: 'button',
-              className: 'shl-lang',
-              'aria-pressed': props.hasOverride === true,
-              'aria-label': langSwitchLabel,
-              title: langSwitchLabel,
-              onClick: props.onToggleLang,
-            }, otherLangLabel)),
+            h('div', { className: 'shl-title-actions' },
+              h('button', {
+                type: 'button',
+                className: 'shl-btn shl-btn-ghost shl-global-clear',
+                onClick: () => { setConfirmClear(false); setConfirmClearAll((value) => !value) },
+                'aria-expanded': confirmClearAll,
+                title: t('header.clearAllTitle'),
+                'aria-label': t('header.clearAllTitle'),
+              }, t('header.clearAll')),
+              h('button', {
+                type: 'button',
+                className: 'shl-lang',
+                'aria-pressed': props.hasOverride === true,
+                'aria-label': langSwitchLabel,
+                title: langSwitchLabel,
+                onClick: props.onToggleLang,
+              }, otherLangLabel))),
           h('div', { className: 'shl-toolbar' },
             h('label', { className: 'shl-check' },
               h('input', {
@@ -1245,7 +1515,7 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               className: 'shl-btn',
-              onClick: () => setConfirmClear((value) => !value),
+              onClick: () => { setConfirmClearAll(false); setConfirmClear((value) => !value) },
               'aria-expanded': confirmClear,
             }, t('header.clear')),
             h('button', { type: 'button', className: 'shl-btn', onClick: handleExport, disabled: exporting },
@@ -1263,7 +1533,10 @@ window.__ModuleLoader__.load({
               className: 'shl-retention',
               role: 'note',
               title: t('header.retentionTitle'),
-            }, t('header.retention', { limit: formatBytes(feed.maxLogFileBytes) }))
+            }, t('header.retention', {
+              limit: formatBytes(feed.maxLogFileBytes),
+              hours: formatRetentionHours(feed.retentionMs),
+            }))
             : null,
           confirmClear
             ? h('div', { className: 'shl-banner' },
@@ -1271,6 +1544,14 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClear, disabled: clearing },
                 clearing ? t('header.clearing') : t('header.clearConfirmYes')),
               h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClear(false), disabled: clearing },
+                t('header.cancel')))
+            : null,
+          confirmClearAll
+            ? h('div', { className: 'shl-banner' },
+              h('span', { className: 'shl-banner-text' }, t('header.clearAllConfirm')),
+              h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClearAll, disabled: clearingAll },
+                clearingAll ? t('header.clearingAll') : t('header.clearAllConfirmYes')),
+              h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClearAll(false), disabled: clearingAll },
                 t('header.cancel')))
             : null,
           actionError != null
@@ -1317,7 +1598,8 @@ window.__ModuleLoader__.load({
             h(RecordDetail, {
               // 以记录 id 作为 key：区块展开与报文切换状态随记录重置。
               key: selectedId == null ? 'none' : String(selectedId),
-              record: selectedRecord,
+              sessionId,
+              record: selectedRecord != null ? selectedRecord : selectedSummary,
               // 新选中的记录尚无详情：将该空档视为加载中，
               // 避免闪现一帧“选择一条请求”的提示。
               loading: selectedId != null && (detail.loading || (selectedRecord == null && detail.error == null)),

@@ -2,13 +2,15 @@
     - id: dsh-plugin-session-http-log
       name: '@local/dsh-plugin-session-http-log'
       config:
-        maxRequestsPerSession: 500
-        maxSessionBytes: 33554432
+        maxRequestsPerTurn: 200
+        maxTurnBytes: 16777216
         maxRequestBodyBytes: 2097152
         maxResponseBodyBytes: 4194304
         maxLogFileBytes: 8388608
-        cleanupOrphans: true
-        orphanSweepIntervalMs: 60000
+        retentionMs: 86400000
+        cleanupLogs: true
+        cleanupIntervalMs: 86400000
+        maxTotalBytes: 536870912
         redactSensitiveHeaders: true
         persist: true
         dataDir: ''

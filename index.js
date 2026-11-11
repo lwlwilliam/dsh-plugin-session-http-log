@@ -15,6 +15,7 @@
  *   GET  /api/dsh-plugin-session-http-log/records?sessionId&limit  → 概要 + 总量，最新在最后
  *   GET  /api/dsh-plugin-session-http-log/record?sessionId&id      → 单条完整记录
  *   POST /api/dsh-plugin-session-http-log/clear                    → { ok, removed }
+ *   POST /api/dsh-plugin-session-http-log/clear-all                → { ok, removedSessions, removedRecords, removedFiles }
  *   GET  /api/dsh-plugin-session-http-log/har?sessionId            → HAR 1.2 归档
  *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir }（打开数据目录）
  *
@@ -22,7 +23,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -31,19 +32,24 @@ import { dirname, join } from 'node:path'
 /* -------------------------------------------------------------------------- */
 
 /** 配置默认值，见 CONTRACT.md。 */
-const DEFAULT_MAX_REQUESTS_PER_SESSION = 500
+const DEFAULT_MAX_REQUESTS_PER_TURN = 200
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
-const DEFAULT_MAX_SESSION_BYTES = 32 * 1024 * 1024
+const DEFAULT_MAX_TURN_BYTES = 16 * 1024 * 1024
 const DEFAULT_MAX_LOG_FILE_BYTES = 8 * 1024 * 1024
-/** 孤儿日志清理的默认扫描间隔。 */
-const DEFAULT_ORPHAN_SWEEP_INTERVAL_MS = 60 * 1000
+/** 自动清理：最后写入后保留 24 小时，之后在清理扫描中删除。 */
+const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
+/** 自动清理扫描间隔：每天一轮；插件启动后另有一次立即扫描。 */
+const DEFAULT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
+/** 所有会话抓包文件的总磁盘安全阀；0 表示不启用。 */
+const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 
 /** 提供给属主浏览器的精确 fetch 路由。 */
 const ROUTE_PATHS = Object.freeze({
   records: '/api/dsh-plugin-session-http-log/records',
   record: '/api/dsh-plugin-session-http-log/record',
   clear: '/api/dsh-plugin-session-http-log/clear',
+  clearAll: '/api/dsh-plugin-session-http-log/clear-all',
   har: '/api/dsh-plugin-session-http-log/har',
   reveal: '/api/dsh-plugin-session-http-log/reveal',
 })
@@ -109,25 +115,31 @@ const DATA_DIR_MARKER_CONTENT = [
   '================================================',
   '',
   '本目录保存 @local/dsh-plugin-session-http-log 插件抓取的各会话原始 HTTP 报文，',
-  '每个会话对应一个 <sessionId>.jsonl 文件，每行一条 JSON 记录。',
+  '每个会话对应一个 <sessionId>.jsonl 正文文件和一个 <sessionId>.jsonl.idx 摘要索引。',
+  '列表只读轻量索引；请求详情按索引中的字节偏移懒读取正文。',
   '',
   '- 卸载插件不会删除本目录，其中的记录会一直保留到手动清理。',
   '- 不再需要这些记录时，可以整体删除本目录，不会影响其他功能。',
-  `- 单个会话文件达到 maxLogFileBytes（默认 ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB）后只保留最近一小段记录并重新写入。`,
-  '- 此上限只影响单个会话，不会因为一个会话超限而删除其它会话的日志。',
-  '- 归档或删除会话后，孤儿清理会删除对应的 jsonl 文件。',
+  '- 每个会话只保留最新一轮对话产生的 HTTP 记录；下一轮开始时上一轮记录会被清空。',
+  `- 单轮文件达到 maxLogFileBytes（默认 ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB）后只保留最近一小段记录并重新写入。`,
+  `- 超过 ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} 小时未更新的日志，以及已归档/已删除会话的日志，会在每日清理中删除。`,
+  `- 所有会话文件另有 maxTotalBytes 总磁盘安全阀（默认 ${DEFAULT_MAX_TOTAL_BYTES / (1024 * 1024)} MiB）。`,
   '- 凭据类请求头（authorization、cookie、api-key 等）默认已脱敏为 [redacted]。',
   '- 清理某个会话只会删除对应的 jsonl 文件，本说明文件会保留。',
   '- 目录名沿用 session-http-log：插件改名不会迁移本目录，以免已有数据丢失。',
   '',
   'This directory holds the raw HTTP capture files of the',
-  '@local/dsh-plugin-session-http-log plugin, one <sessionId>.jsonl per session.',
+  '@local/dsh-plugin-session-http-log plugin: <sessionId>.jsonl payload plus a',
+  '<sessionId>.jsonl.idx lightweight summary index. Lists read only the index;',
+  'request details are loaded lazily by byte offset.',
   'Uninstalling the plugin does NOT delete them, and the directory is',
   'safe to delete wholesale once the captures are no longer needed.',
-  `Each session file is reset when it reaches maxLogFileBytes (default ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB),`,
-  'keeping only its most recent records;',
-  'this never deletes another session\'s file. Orphan cleanup removes files',
-  'for archived or deleted sessions. Credential headers are redacted by default.',
+  'Only the latest turn of each session is retained; a new turn clears the previous one.',
+  `Each turn file is reset when it reaches maxLogFileBytes (default ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB),`,
+  'keeping only its most recent records.',
+  `Files not updated for ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} hours, and files for archived/deleted sessions,`,
+  'are removed by the daily cleanup. A global maxTotalBytes safety cap also applies.',
+  'Credential headers are redacted by default.',
   'The directory name stays "session-http-log" so a plugin rename never',
   'orphans existing captures.',
   '',
@@ -173,24 +185,43 @@ export function apply(ctx, config = {}) {
   for (const route of runtime.routes) {
     ctx.effect(() => runtime.registerRoute(route), `dsh-plugin-session-http-log: ${route.path}`)
   }
+  // 只保留每个会话最新一轮：turn/start 是 Host 已提交事件，使用它作为
+  // 清理边界，避免依赖模型请求本身去猜测轮次。
+  ctx.effect(() => {
+    if (typeof ctx.on !== 'function') return () => {}
+    const dispose = ctx.on('session/event', (session, event) => {
+      try {
+        runtime.handleSessionEvent(session, event)
+      } catch (error) {
+        runtime.reportError('session-event', error)
+      }
+    })
+    return () => {
+      try {
+        const result = dispose?.()
+        if (result !== null && typeof result?.then === 'function') result.catch(() => {})
+      } catch {
+        /* 插件卸载期间释放监听失败不影响宿主 */
+      }
+    }
+  }, 'dsh-plugin-session-http-log: latest-turn retention')
   // 说明文件是尽力而为的副产物：不 await，失败只记日志，绝不影响激活。
   runtime.writeDirectoryMarker()
-  // 会话可能在本进程运行期间被归档或删除；定时扫描一次数据目录，
-  // 删掉已没有对应会话的 JSONL。扫描只碰本插件命名的 *.jsonl，
-  // 且读不到权威会话列表时会安全跳过。
+  // 自动清理在启动后约 1 秒先扫一轮，之后每天扫一轮：
+  // 删除归档/删除会话的孤儿文件，以及超过保留时间未更新的文件。
   ctx.effect(() => {
-    if (runtime.cleanupOrphans !== true) return () => {}
+    if (runtime.cleanupLogs !== true) return () => {}
     let initialTimer = null
-    const sweep = () => { void runtime.sweepOrphanLogs() }
+    const sweep = () => { void runtime.sweepLogs() }
     initialTimer = setTimeout(sweep, 1000)
     if (typeof initialTimer.unref === 'function') initialTimer.unref()
-    const interval = setInterval(sweep, runtime.orphanSweepIntervalMs)
+    const interval = setInterval(sweep, runtime.cleanupIntervalMs)
     if (typeof interval.unref === 'function') interval.unref()
     return () => {
       if (initialTimer !== null) clearTimeout(initialTimer)
       clearInterval(interval)
     }
-  }, 'dsh-plugin-session-http-log: orphan log cleanup')
+  }, 'dsh-plugin-session-http-log: daily log cleanup')
 }
 
 /* -------------------------------------------------------------------------- */
@@ -202,13 +233,15 @@ export function apply(ctx, config = {}) {
  * 未知键会被忽略。
  * @param {unknown} raw - Loader 提供的配置值。
  * @returns {{
- *   maxRequestsPerSession: number,
+ *   maxRequestsPerTurn: number,
  *   maxRequestBodyBytes: number,
  *   maxResponseBodyBytes: number,
- *   maxSessionBytes: number,
+ *   maxTurnBytes: number,
  *   maxLogFileBytes: number,
- *   cleanupOrphans: boolean,
- *   orphanSweepIntervalMs: number,
+ *   retentionMs: number,
+ *   cleanupLogs: boolean,
+ *   cleanupIntervalMs: number,
+ *   maxTotalBytes: number,
  *   redactSensitiveHeaders: boolean,
  *   persist: boolean,
  *   captureUnattributed: boolean,
@@ -220,13 +253,25 @@ function resolveConfig(raw) {
   const input = raw !== null && typeof raw === 'object' ? raw : {}
   const dataDir = typeof input.dataDir === 'string' ? input.dataDir.trim() : ''
   return {
-    maxRequestsPerSession: positiveInteger(input.maxRequestsPerSession, DEFAULT_MAX_REQUESTS_PER_SESSION),
+    // 新名字表达“最新一轮”语义；旧配置名保留为兼容别名。
+    maxRequestsPerTurn: positiveInteger(
+      input.maxRequestsPerTurn,
+      positiveInteger(input.maxRequestsPerSession, DEFAULT_MAX_REQUESTS_PER_TURN),
+    ),
     maxRequestBodyBytes: positiveInteger(input.maxRequestBodyBytes, DEFAULT_MAX_REQUEST_BODY_BYTES),
     maxResponseBodyBytes: positiveInteger(input.maxResponseBodyBytes, DEFAULT_MAX_RESPONSE_BODY_BYTES),
-    maxSessionBytes: positiveInteger(input.maxSessionBytes, DEFAULT_MAX_SESSION_BYTES),
+    maxTurnBytes: positiveInteger(
+      input.maxTurnBytes,
+      positiveInteger(input.maxSessionBytes, DEFAULT_MAX_TURN_BYTES),
+    ),
     maxLogFileBytes: positiveInteger(input.maxLogFileBytes, DEFAULT_MAX_LOG_FILE_BYTES),
-    cleanupOrphans: input.cleanupOrphans !== false,
-    orphanSweepIntervalMs: positiveInteger(input.orphanSweepIntervalMs, DEFAULT_ORPHAN_SWEEP_INTERVAL_MS),
+    retentionMs: positiveInteger(input.retentionMs, DEFAULT_RETENTION_MS),
+    cleanupLogs: input.cleanupLogs !== false && input.cleanupOrphans !== false,
+    cleanupIntervalMs: positiveInteger(
+      input.cleanupIntervalMs,
+      positiveInteger(input.orphanSweepIntervalMs, DEFAULT_CLEANUP_INTERVAL_MS),
+    ),
+    maxTotalBytes: nonNegativeInteger(input.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES),
     redactSensitiveHeaders: input.redactSensitiveHeaders !== false,
     persist: input.persist !== false,
     captureUnattributed: input.captureUnattributed === true,
@@ -244,6 +289,17 @@ function resolveConfig(raw) {
  */
 function positiveInteger(value, fallback) {
   if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value)
+  return fallback
+}
+
+/**
+ * 读取一个非负整数选项；0 在 `maxTotalBytes` 等字段上表示关闭。
+ * @param {unknown} value - 原始选项值。
+ * @param {number} fallback - 任何不可用值的默认值。
+ * @returns {number}
+ */
+function nonNegativeInteger(value, fallback) {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value)
   return fallback
 }
 
@@ -310,7 +366,7 @@ function resolveWslWindowsDirectory(dir) {
       execFile(
         'wslpath',
         ['-w', dir],
-        { encoding: 'utf8', timeout: 2000, windowsHide: true, maxBuffer: 64 * 1024 },
+        { encoding: 'utf8', timeout: 5000, windowsHide: true, maxBuffer: 64 * 1024 },
         (error, stdout) => {
           const converted = typeof stdout === 'string' ? stdout.trim() : ''
           resolve(error === null && converted !== '' ? converted : wslFallbackWindowsDirectory(dir))
@@ -362,8 +418,12 @@ function createRuntime(ctx, config) {
   let captureSignal = null
   /** 在 install 之前和 dispose 之后为 false；禁用新的捕获。 */
   let captureEnabled = false
-  /** 防止定时器和手动触发产生重叠的孤儿扫描。 */
-  let sweepingOrphans = false
+  /** “清空全部”执行期间暂停新捕获，避免边删文件边写入。 */
+  let clearingAll = false
+  /** 合并并发的“清空全部”请求，保证删除过程只有一个执行者。 */
+  let clearingAllPromise = null
+  /** 防止定时器和手动触发产生重叠的日志清理扫描。 */
+  let sweepingLogs = false
 
   /* ---------------------------------------------------------------- 日志    */
 
@@ -428,19 +488,25 @@ function createRuntime(ctx, config) {
 
   /**
    * 获取或创建一个会话的内存桶。
-   * `bytes` 是 `records` 的估算存储大小，受 `maxSessionBytes` 限制；
+   * `bytes` 是 `records` 的估算存储大小，受 `maxTurnBytes` 限制；
    * `logBytes` 缓存 JSONL 文件大小用于磁盘增长上限（null 表示
-   * “尚未测量”）。
+   * “尚未测量”）。`currentTurn`/`generation` 用于保证切换轮次后，
+   * 上一轮迟到的捕获结果不会重新写回。
    * @param {string} sessionId - 会话 id 或 unattributed 桶名。
    * @returns {{
    *   sessionId: string,
    *   nextId: number,
    *   records: object[],
+   *   summaries: object[],
    *   bytes: number,
    *   loadedFromDisk: boolean,
    *   loading: Promise<void>|undefined,
    *   pending: Set<Promise<unknown>>,
+   *   activeExchanges: number,
    *   logBytes: number|null,
+   *   currentTurn: number|null,
+   *   generation: number,
+   *   revision: number,
    * }}
    */
   function sessionEntry(sessionId) {
@@ -450,15 +516,64 @@ function createRuntime(ctx, config) {
         sessionId,
         nextId: 1,
         records: [],
+        summaries: [],
         bytes: 0,
         loadedFromDisk: false,
         loading: undefined,
         pending: new Set(),
+        activeExchanges: 0,
         logBytes: null,
+        currentTurn: null,
+        generation: 0,
+        revision: 0,
       }
       sessions.set(sessionId, entry)
     }
     return entry
+  }
+
+  /**
+   * 一个会话进入新轮次时，只保留当前轮的内存记录并递增 generation；
+   * generation 变化后，上一轮迟到的响应捕获不会再写入磁盘。
+   * @param {string} sessionId - 会话 id。
+   * @param {number} turn - Host 提交的 turn 编号。
+   * @returns {ReturnType<typeof sessionEntry>}
+   */
+  function beginTurn(sessionId, turn) {
+    const entry = sessionEntry(sessionId)
+    for (const record of entry.records) evictedRecords.add(record)
+    entry.records = []
+    entry.summaries = []
+    entry.bytes = 0
+    entry.loadedFromDisk = true
+    entry.currentTurn = Number.isInteger(turn) ? turn : entry.currentTurn
+    entry.generation += 1
+    entry.revision += 1
+    entry.logBytes = 0
+    return entry
+  }
+
+  /**
+   * Host 的 session/event 监听入口：收到 turn/start 时清空上一轮抓包。
+   * 不依赖 `turn/end`，因为新轮次开始时上一轮必然已经结束。
+   * @param {{ id?: unknown }|null|undefined} session - 事件所属会话。
+   * @param {{ type?: unknown, data?: { turn?: unknown } }|null|undefined} event - 已提交事件。
+   */
+  function handleSessionEvent(session, event) {
+    if (event?.type !== 'turn/start' || clearingAll) return
+    const sessionId = session !== null && typeof session === 'object' ? session.id : undefined
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    const turn = event?.data?.turn
+    const entry = beginTurn(sessionId, turn)
+    if (config.persist !== true) return
+    // 必须进入该文件的串行写队列，等到上一轮已排队的追加全部落盘后再清空；
+    // 新轮次随后排队的 append 会自然落在清空之后。
+    enqueueFileTask(sessionFile(sessionId), async () => {
+      await mkdir(dirname(sessionFile(sessionId)), { recursive: true })
+      await writeFile(sessionFile(sessionId), '', 'utf8')
+      await writeFile(sessionIndexFile(sessionId), '', 'utf8')
+      if (sessions.get(sessionId) === entry) entry.logBytes = 0
+    }, 'turn-reset')
   }
 
   /**
@@ -474,8 +589,9 @@ function createRuntime(ctx, config) {
     }
     if (entry.loadedFromDisk) return entry
     entry.loadedFromDisk = true
-    if (entry.records.length > 0 || config.persist !== true) return entry
-    entry.loading = loadSessionFile(sessionId, entry)
+    if (entry.summaries.length > 0 || config.persist !== true) return entry
+    const generation = entry.generation
+    entry.loading = loadSessionIndex(sessionId, entry, generation)
     try {
       await entry.loading
     } finally {
@@ -496,13 +612,41 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * 把最后 `maxRequestsPerSession` 条完整 JSONL 记录加载进一个桶。
-   * 追加被中断产生的残缺末行会被跳过。
+   * 一条索引行：列表 summary + 正文在 JSONL 中的字节偏移。
+   * @param {object} record - 完整记录或已有摘要。
+   * @param {number} offset - 正文行在 JSONL 中的起始字节。
+   * @param {number} length - 正文行的字节长度（不含换行）。
+   * @returns {object}
+   */
+  function indexSummaryOf(record, offset, length) {
+    return {
+      ...summarizeRecord(record),
+      turn: Number.isInteger(record?.turn) ? record.turn : null,
+      offset,
+      length,
+    }
+  }
+
+  /**
+   * 序列化一条索引行。
+   * @param {object} record - 完整记录或已有摘要。
+   * @param {number} offset - 正文行起始字节。
+   * @param {number} length - 正文行字节长度。
+   * @returns {string}
+   */
+  function indexLineOf(record, offset, length) {
+    return `${JSON.stringify(indexSummaryOf(record, offset, length))}\n`
+  }
+
+  /**
+   * 从旧版完整 JSONL 重建索引。旧文件只在升级后的首次冷读时解析一次；
+   * 之后列表只读 `.jsonl.idx`，详情按偏移懒读取。
    * @param {string} sessionId - 会话 id。
-   * @param {{ nextId: number, records: object[] }} entry - 要填充的桶。
+   * @param {ReturnType<typeof sessionEntry>} entry - 会话桶。
+   * @param {number} generation - 读取时的 generation。
    * @returns {Promise<void>}
    */
-  async function loadSessionFile(sessionId, entry) {
+  async function loadLegacySessionFile(sessionId, entry, generation) {
     const file = sessionFile(sessionId)
     let text
     try {
@@ -511,33 +655,100 @@ function createRuntime(ctx, config) {
       if (error?.code !== 'ENOENT') reportOnce(`load:${sessionId}`, error)
       return
     }
+    if (entry.generation !== generation) return
     if (typeof text !== 'string' || text.length === 0) return
-    const loaded = []
+    const summaries = []
+    let offset = 0
     for (const line of text.split('\n')) {
+      const length = Buffer.byteLength(line, 'utf8')
+      const start = offset
+      offset += length + 1
       const trimmed = line.trim()
       if (trimmed === '') continue
       try {
         const record = JSON.parse(trimmed)
-        if (record !== null && typeof record === 'object' && Number.isInteger(record.id)) loaded.push(record)
+        if (record !== null && typeof record === 'object' && Number.isInteger(record.id)) {
+          summaries.push(indexSummaryOf(record, start, length))
+        }
       } catch {
         /* 追加被中断时留下的残缺行 */
       }
     }
-    if (loaded.length === 0) return
-    const tail = loaded.slice(-config.maxRequestsPerSession)
-    for (const record of tail) {
-      if (typeof record.id === 'number' && record.id >= entry.nextId) entry.nextId = record.id + 1
+    if (summaries.length === 0) return
+    const tail = summaries.slice(-config.maxRequestsPerTurn)
+    for (const summary of tail) {
+      if (typeof summary.id === 'number' && summary.id >= entry.nextId) entry.nextId = summary.id + 1
+      if (Number.isInteger(summary.turn)) entry.currentTurn = summary.turn
     }
-    if (entry.records.length > 0) return
-    entry.records = tail
-    for (const record of entry.records) {
-      const size = estimateRecordBytes(record)
-      accountedBytes.set(record, size)
-      entry.bytes += size
-      // 这些行来自当前 JSONL；轮转时可以把它们作为安全的历史尾部重写。
-      persistedRecords.add(record)
+    if (entry.generation !== generation) return
+    entry.summaries = tail
+    const indexText = tail
+      .map((summary) => `${JSON.stringify(summary)}\n`)
+      .join('')
+    try {
+      await writeFile(sessionIndexFile(sessionId), indexText, 'utf8')
+    } catch (error) {
+      reportOnce(`index-rebuild:${sessionId}`, error)
     }
-    enforceSessionBytes(entry)
+  }
+
+  /**
+   * 冷读摘要索引。索引不存在时回退到旧版完整 JSONL 并重建一次。
+   * 摘要读取不会解析 requestBody/responseBody，因此列表打开只与索引大小相关。
+   * @param {string} sessionId - 会话 id。
+   * @param {ReturnType<typeof sessionEntry>} entry - 会话桶。
+   * @param {number} generation - 读取时的 generation。
+   * @returns {Promise<void>}
+   */
+  async function loadSessionIndex(sessionId, entry, generation) {
+    const file = sessionIndexFile(sessionId)
+    let text
+    try {
+      text = await readFile(file, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        await loadLegacySessionFile(sessionId, entry, generation)
+        return
+      }
+      reportOnce(`load-index:${sessionId}`, error)
+      return
+    }
+    if (entry.generation !== generation) return
+    if (typeof text !== 'string' || text.length === 0) {
+      await loadLegacySessionFile(sessionId, entry, generation)
+      return
+    }
+    const summaries = []
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      try {
+        const summary = JSON.parse(trimmed)
+        if (
+          summary !== null &&
+          typeof summary === 'object' &&
+          Number.isInteger(summary.id) &&
+          Number.isInteger(summary.offset) &&
+          Number.isInteger(summary.length) &&
+          summary.length >= 0
+        ) {
+          summaries.push(summary)
+        }
+      } catch {
+        /* 索引尾部残缺时跳过 */
+      }
+    }
+    if (summaries.length === 0) {
+      await loadLegacySessionFile(sessionId, entry, generation)
+      return
+    }
+    const tail = summaries.slice(-config.maxRequestsPerTurn)
+    for (const summary of tail) {
+      if (typeof summary.id === 'number' && summary.id >= entry.nextId) entry.nextId = summary.id + 1
+      if (Number.isInteger(summary.turn)) entry.currentTurn = summary.turn
+    }
+    if (entry.generation !== generation) return
+    entry.summaries = tail
   }
 
   /**
@@ -547,6 +758,16 @@ function createRuntime(ctx, config) {
    */
   function sessionFile(sessionId) {
     return join(config.dataDir, `${safeFileName(sessionId)}.jsonl`)
+  }
+
+  /**
+   * 会话摘要索引文件路径。每行只保存列表需要的轻量 summary 和正文
+   * 在 JSONL 中的字节偏移；请求详情时再按偏移读取正文。
+   * @param {string} sessionId - 会话 id。
+   * @returns {string}
+   */
+  function sessionIndexFile(sessionId) {
+    return join(config.dataDir, `${safeFileName(sessionId)}.jsonl.idx`)
   }
 
   /**
@@ -577,10 +798,14 @@ function createRuntime(ctx, config) {
    * @param {object} record - 要追加的内部记录。
    */
   function pushRecord(entry, record) {
+    entry.revision += 1
     entry.records.push(record)
+    entry.summaries.push(record)
     accountRecordBytes(entry, record)
     enforceSessionBytes(entry)
-    const overflow = entry.records.length - config.maxRequestsPerSession
+    const summaryOverflow = entry.summaries.length - config.maxRequestsPerTurn
+    if (summaryOverflow > 0) entry.summaries.splice(0, summaryOverflow)
+    const overflow = entry.records.length - config.maxRequestsPerTurn
     if (overflow > 0) {
       for (const removed of entry.records.splice(0, overflow)) releaseRecordBytes(entry, removed)
     }
@@ -623,22 +848,25 @@ function createRuntime(ctx, config) {
     if (entry === null || entry === undefined) return
     if (evictedRecords.has(record)) return
     accountRecordBytes(entry, record)
+    entry.revision += 1
     enforceSessionBytes(entry)
   }
 
   /**
-   * 淘汰最旧的记录，直到会话符合其字节预算，
+   * 淘汰最旧的记录，直到当前轮符合其字节预算，
    * 同时始终保留最新记录，使面板仍能看到实时交换。
    * @param {ReturnType<typeof sessionEntry>} entry - 会话桶。
    */
   function enforceSessionBytes(entry) {
-    while (entry.bytes > config.maxSessionBytes && entry.records.length > 1) {
+    while (entry.bytes > config.maxTurnBytes && entry.records.length > 1) {
       const removed = entry.records.shift()
+      const summaryIndex = entry.summaries.findIndex((candidate) => candidate.id === removed.id)
+      if (summaryIndex >= 0) entry.summaries.splice(summaryIndex, 1)
       releaseRecordBytes(entry, removed)
       reportOnce(
         `session-bytes:${entry.sessionId}`,
         new Error(
-          `memory budget of ${config.maxSessionBytes} bytes reached; dropped oldest records`,
+          `turn memory budget of ${config.maxTurnBytes} bytes reached; dropped oldest records`,
         ),
       )
     }
@@ -651,7 +879,7 @@ function createRuntime(ctx, config) {
    * @param {object[]} records - 会话内存桶中的记录。
    * @param {object} current - 当前待持久化记录。
    * @param {number} budget - 期望保留的字节预算。
-   * @returns {{ text: string, bytes: number, records: object[] }}
+   * @returns {{ text: string, indexText: string, bytes: number, records: object[] }}
    */
   function rotationTail(records, current, budget) {
     const selected = []
@@ -700,70 +928,101 @@ function createRuntime(ctx, config) {
       const rightId = Number.isInteger(right.record?.id) ? right.record.id : 0
       return leftId - rightId
     })
+    const indexLines = []
+    let offset = 0
+    for (const item of selected) {
+      const lineBytes = Buffer.byteLength(item.line, 'utf8')
+      const bodyLength = Math.max(0, lineBytes - 1)
+      indexLines.push(indexLineOf(item.record, offset, bodyLength))
+      offset += lineBytes
+    }
     return {
       text: selected.map((entry) => entry.line).join(''),
+      indexText: indexLines.join(''),
       bytes: total,
       records: selected.map((entry) => entry.record),
     }
   }
 
   /**
-   * 把一条完成的记录追加到会话文件，按文件串行化。
-   * 文件上限为 `maxLogFileBytes`：每个会话测量一次大小，之后按追加的
-   * 字节长度累计。超过上限时只重写这个会话最近的少量记录，而不是把
-   * 整个历史直接丢弃；其它会话完全不受影响，也绝不影响捕获、路由或
-   * fetch 调用方。
-   * @param {string} sessionId - 会话 id。
-   * @param {object} record - 已完成的内部记录。
+   * 把一个任务追加到某个文件的串行写队列。清理轮次、追加和全局删除
+   * 都走同一队列，确保不会出现旧轮次的迟到 append 覆盖新文件。
+   * @param {string} file - JSONL 绝对路径。
+   * @param {() => Promise<void>} task - 队列任务。
+   * @param {string} label - 错误上报标签。
+   * @returns {Promise<void>}
    */
-  function persistRecord(sessionId, record) {
-    if (config.persist !== true) return
-    let line
-    try {
-      line = `${JSON.stringify(record)}\n`
-    } catch (error) {
-      reportOnce('persist-serialize', error)
-      return
-    }
-    const bytes = Buffer.byteLength(line, 'utf8')
-    const file = sessionFile(sessionId)
-    const entry = sessionEntry(sessionId)
+  function enqueueFileTask(file, task, label) {
     const previous = pendingWrites.get(file) ?? Promise.resolve()
     const next = previous
-      .then(async () => {
-        if (entry.logBytes === null) entry.logBytes = await fileSize(file)
-        if (entry.logBytes > 0 && entry.logBytes + bytes > config.maxLogFileBytes) {
-          // 单会话磁盘上限：保留最近约 1/4 上限的记录（最多 2 MiB），
-          // 然后继续追加后续记录。其它会话的文件完全不受影响。
-          const tailBudget = Math.max(
-            1024,
-            Math.min(2 * 1024 * 1024, Math.floor(config.maxLogFileBytes / 4)),
-          )
-          const tail = rotationTail(entry.records, record, tailBudget)
-          try {
-            await unlink(file)
-          } catch (error) {
-            if (error?.code !== 'ENOENT') throw error
-          }
-          await mkdir(dirname(file), { recursive: true })
-          await writeFile(file, tail.text, 'utf8')
-          entry.logBytes = tail.bytes
-          for (const persisted of tail.records) persistedRecords.add(persisted)
-          return
-        }
-        await mkdir(dirname(file), { recursive: true })
-        await appendFile(file, line, 'utf8')
-        entry.logBytes += bytes
-        persistedRecords.add(record)
-      })
+      .then(task)
       .catch((error) => {
-        reportOnce(`persist:${file}`, error)
+        reportOnce(`write:${label}:${file}`, error)
       })
     pendingWrites.set(file, next)
     const settle = () => {
       if (pendingWrites.get(file) === next) pendingWrites.delete(file)
     }
     next.then(settle, settle)
+    return next
+  }
+
+  /**
+   * 把一条完成的记录追加到当前轮文件，按文件串行化。
+   * 文件上限为 `maxLogFileBytes`：每个会话测量一次大小，之后按追加的
+   * 字节长度累计。超过上限时只重写这个会话最近的少量记录，而不是把
+   * 整个历史直接丢弃；其它会话完全不受影响，也绝不影响捕获、路由或
+   * fetch 调用方。写入前再次核对 generation，防止切轮后才完成的响应
+   * 把上一轮记录写回新文件。
+   * @param {string} sessionId - 会话 id。
+   * @param {object} record - 已完成的内部记录。
+   * @param {number} generation - 记录开始时的会话轮次 generation。
+   * @param {object} originatingEntry - 记录所属的内存桶；桶被替换后旧写入必须丢弃。
+   */
+  function persistRecord(sessionId, record, generation, originatingEntry) {
+    if (config.persist !== true) return
+    const file = sessionFile(sessionId)
+    enqueueFileTask(file, async () => {
+      // 先让出事件循环，再做大报文序列化；写盘调用方（fetch/对话）从不 await
+      // 本任务，因此保存日志不会阻塞当前请求。
+      await new Promise((resolve) => setImmediate(resolve))
+      const entry = sessions.get(sessionId)
+      if (entry !== originatingEntry || entry === undefined || entry.generation !== generation) return
+      let line
+      try {
+        line = `${JSON.stringify(record)}\n`
+      } catch (error) {
+        reportOnce('persist-serialize', error)
+        return
+      }
+      const bytes = Buffer.byteLength(line, 'utf8')
+      if (entry.logBytes === null) entry.logBytes = await fileSize(file)
+      const indexFile = sessionIndexFile(sessionId)
+      if (entry.logBytes > 0 && entry.logBytes + bytes > config.maxLogFileBytes) {
+        // 单轮磁盘上限：保留最近约 1/4 上限的记录（最多 2 MiB），
+        // 然后同时重写正文和轻量索引。其它会话的文件完全不受影响。
+        const tailBudget = Math.max(
+          1024,
+          Math.min(2 * 1024 * 1024, Math.floor(config.maxLogFileBytes / 4)),
+        )
+        const tail = rotationTail(entry.records, record, tailBudget)
+        await mkdir(dirname(file), { recursive: true })
+        await writeFile(file, tail.text, 'utf8')
+        await writeFile(indexFile, tail.indexText, 'utf8')
+        entry.logBytes = tail.bytes
+        entry.summaries = tail.records.slice()
+        entry.revision += 1
+        for (const persisted of tail.records) persistedRecords.add(persisted)
+        return
+      }
+      const bodyOffset = entry.logBytes
+      await mkdir(dirname(file), { recursive: true })
+      await appendFile(file, line, 'utf8')
+      entry.logBytes += bytes
+      await appendFile(indexFile, indexLineOf(record, bodyOffset, Math.max(0, bytes - 1)), 'utf8')
+      entry.revision += 1
+      persistedRecords.add(record)
+    }, 'persist')
   }
 
   /**
@@ -782,6 +1041,62 @@ function createRuntime(ctx, config) {
   }
 
   /**
+   * 按索引中的字节偏移懒读取一条完整记录，不解析整个 JSONL。
+   * @param {string} sessionId - 会话 id。
+   * @param {{ offset: number, length: number }} summary - 索引 summary。
+   * @returns {Promise<object|null>}
+   */
+  async function readRecordAt(sessionId, summary) {
+    if (!Number.isInteger(summary?.offset) || !Number.isInteger(summary?.length)) return null
+    let handle
+    try {
+      handle = await open(sessionFile(sessionId), 'r')
+      const buffer = Buffer.alloc(summary.length)
+      let read = 0
+      while (read < summary.length) {
+        const result = await handle.read(buffer, read, summary.length - read, summary.offset + read)
+        if (result.bytesRead <= 0) break
+        read += result.bytesRead
+      }
+      if (read !== summary.length) return null
+      const record = JSON.parse(buffer.toString('utf8'))
+      return record !== null && typeof record === 'object' && Number.isInteger(record.id) ? record : null
+    } catch (error) {
+      if (error?.code !== 'ENOENT') reportOnce(`read-record:${sessionId}`, error)
+      return null
+    } finally {
+      if (handle !== undefined) {
+        try {
+          await handle.close()
+        } catch {
+          /* 只读句柄关闭失败不阻塞请求 */
+        }
+      }
+    }
+  }
+
+  /**
+   * 读取某会话当前索引对应的全部完整记录，供 HAR 导出等确实需要全部
+   * body 的少数操作使用。正常列表/详情路径不会调用它。
+   * @param {string} sessionId - 会话 id。
+   * @param {ReturnType<typeof sessionEntry>} entry - 会话桶。
+   * @returns {Promise<object[]>}
+   */
+  async function loadSessionRecords(sessionId, entry) {
+    const loaded = []
+    for (const summary of entry.summaries) {
+      const inMemory = entry.records.find((record) => record.id === summary.id)
+      if (inMemory !== undefined) {
+        loaded.push(inMemory)
+        continue
+      }
+      const record = await readRecordAt(sessionId, summary)
+      if (record !== null) loaded.push(record)
+    }
+    return loaded
+  }
+
+  /**
    * 把某个会话从内存和磁盘中移除，并报告移除了多少。
    * 只删除该会话的 jsonl 文件；数据目录与说明文件（README.txt）保留。
    * @param {string} sessionId - 已验证的会话 id。
@@ -789,27 +1104,87 @@ function createRuntime(ctx, config) {
    */
   async function clearSession(sessionId) {
     const entry = await readSession(sessionId)
-    const removed = entry.records.length
+    const removed = entry.summaries.length
+    entry.generation += 1
     sessions.delete(sessionId)
     if (config.persist !== true) return removed
     const file = sessionFile(sessionId)
-    const pendingWrite = pendingWrites.get(file)
-    if (pendingWrite !== undefined) {
-      try {
-        await pendingWrite
-      } catch {
-        /* 追加失败已经上报过 */
+    // 删除也走该文件的串行队列：之前排队的 append 先结束，清空后新轮次/
+    // 新会话随后排队的 append 才会重建文件，不会出现清空后又被旧写入覆盖。
+    await enqueueFileTask(file, async () => {
+      for (const target of [file, sessionIndexFile(sessionId)]) {
+        try {
+          await unlink(target)
+        } catch (error) {
+          if (error?.code !== 'ENOENT') reportOnce(`clear:${target}`, error)
+        }
       }
-    }
-    pendingWrites.delete(file)
-    try {
-      await unlink(file)
-    } catch (error) {
-      if (error?.code !== 'ENOENT') reportOnce(`clear:${file}`, error)
-    }
+    }, 'clear')
     entry.logBytes = null
     entry.bytes = 0
     return removed
+  }
+
+  /**
+   * 清空所有会话的内存记录与持久化抓包文件。
+   * 删除期间暂停新捕获；`README.txt` 和任何不认识的普通文件保持不动。
+   * @returns {Promise<{ removedSessions: number, removedRecords: number, removedFiles: number }>}
+   */
+  function clearAllSessions() {
+    if (clearingAllPromise !== null) return clearingAllPromise
+    clearingAll = true
+    clearingAllPromise = (async () => {
+      const current = [...sessions.values()]
+      let removedRecords = 0
+      for (const entry of current) {
+        removedRecords += entry.summaries.length
+        entry.generation += 1
+        entry.records = []
+        entry.summaries = []
+        entry.bytes = 0
+        entry.logBytes = null
+      }
+      sessions.clear()
+      // 先让所有已排队的写入结束；期间 clearingAll 阻止新捕获和新 turn 重置，
+      // 然后通过同一文件队列逐个删除，避免 unlink 与新 append 竞争。
+      await Promise.allSettled([...pendingWrites.values()])
+
+      let removedFiles = 0
+      if (config.persist === true) {
+        let entries = []
+        try {
+          entries = await readdir(config.dataDir, { withFileTypes: true })
+        } catch (error) {
+          if (error?.code !== 'ENOENT') reportOnce('clear-all-readdir', error)
+        }
+        const deletions = []
+        for (const dirent of entries) {
+          if (dirent === null || typeof dirent !== 'object' || dirent.isFile?.() !== true) continue
+          const name = String(dirent.name)
+          if (!name.endsWith('.jsonl') && !name.endsWith('.jsonl.idx')) continue
+          const sessionId = name.endsWith('.jsonl.idx')
+            ? name.slice(0, -'.jsonl.idx'.length)
+            : name.slice(0, -'.jsonl'.length)
+          if (!SESSION_ID_PATTERN.test(sessionId)) continue
+          const file = join(config.dataDir, name)
+          deletions.push(enqueueFileTask(file, async () => {
+            try {
+              await unlink(file)
+              removedFiles += 1
+            } catch (error) {
+              if (error?.code !== 'ENOENT') reportOnce(`clear-all-unlink:${file}`, error)
+            }
+          }, 'clear-all'))
+        }
+        await Promise.allSettled(deletions)
+      }
+      pendingWrites.clear()
+      return { removedSessions: current.length, removedRecords, removedFiles }
+    })().finally(() => {
+      clearingAll = false
+      clearingAllPromise = null
+    })
+    return clearingAllPromise
   }
 
   /* -------------------------------------------------------------- 孤儿清理    */
@@ -827,20 +1202,25 @@ function createRuntime(ctx, config) {
     const known = new Set()
     /** `Map<childSessionId, parentSessionId>`：用于把子代理/团队日志跟着父会话清理。 */
     const parentBySession = new Map()
-    try {
-      const liveSessions = ctx.get('sessions')
-      if (liveSessions !== undefined && typeof liveSessions.list === 'function') {
-        for (const session of liveSessions.list()) {
-          const id = session !== null && typeof session === 'object' ? session.id : session
-          if (typeof id !== 'string' || id === '') continue
-          known.add(id)
-          const parent = session?.header?.parentSession
-          if (typeof parent === 'string' && parent !== '') parentBySession.set(id, parent)
+    /** 收集当前 live Session；返回 false 表示服务不可用，本轮必须放弃。 */
+    const collectLiveSessions = () => {
+      try {
+        const liveSessions = ctx.get('sessions')
+        if (liveSessions !== undefined && typeof liveSessions.list === 'function') {
+          for (const session of liveSessions.list()) {
+            const id = session !== null && typeof session === 'object' ? session.id : session
+            if (typeof id !== 'string' || id === '') continue
+            known.add(id)
+            const parent = session?.header?.parentSession
+            if (typeof parent === 'string' && parent !== '') parentBySession.set(id, parent)
+          }
         }
+        return true
+      } catch {
+        return false
       }
-    } catch {
-      return null
     }
+    if (!collectLiveSessions()) return null
     try {
       const persistence = ctx.get('sessionPersistence')
       if (persistence === undefined || typeof persistence.list !== 'function') return null
@@ -859,6 +1239,9 @@ function createRuntime(ctx, config) {
       reportOnce('orphan-known-sessions', error)
       return null
     }
+    // sessionPersistence.list() 可能很慢；等待期间新建的 live Session 必须补进来，
+    // 否则会被误判成孤儿并删除。
+    if (!collectLiveSessions()) return null
     // 归档会话仍在 sessionPersistence 中，但用户已经把它从会话列表移走；
     // 按本插件的保留策略，抓包数据一并清理，避免长期残留。
     try {
@@ -889,14 +1272,57 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * 扫描数据目录，删除不属于任何有效/未归档会话的 `.jsonl` 文件。
+   * 删除一个会话日志文件，并让该会话的内存桶失效。
+   * 有正在进行的捕获或写入时跳过，避免把仍在使用的文件删掉后又被追加。
+   * @param {string} sessionId - 会话 id。
+   * @param {string} file - JSONL 绝对路径。
+   * @returns {Promise<boolean>} 是否删除成功。
+   */
+  async function removeLogFile(sessionId, file) {
+    if (clearingAll) return false
+    let removed = false
+    await enqueueFileTask(file, async () => {
+      const activeEntry = sessions.get(sessionId)
+      if (activeEntry !== undefined && (activeEntry.pending.size > 0 || activeEntry.activeExchanges > 0)) return
+      const generation = activeEntry?.generation
+      for (const target of [file, sessionIndexFile(sessionId)]) {
+        try {
+          await unlink(target)
+        } catch (error) {
+          if (error?.code !== 'ENOENT') {
+            reportOnce(`cleanup-unlink:${target}`, error)
+            return
+          }
+        }
+      }
+      removed = true
+      // 删除 await 期间可能已有新请求写入同一会话。只有内存桶仍未变化且
+      // 没有进行中的捕获时，才把该桶也失效；否则新请求会通过后续队列重建文件。
+      const latestEntry = sessions.get(sessionId)
+      if (
+        latestEntry !== undefined &&
+        latestEntry === activeEntry &&
+        latestEntry.generation === generation &&
+        latestEntry.pending.size === 0 &&
+        latestEntry.activeExchanges === 0
+      ) {
+        latestEntry.generation += 1
+        sessions.delete(sessionId)
+      }
+    }, 'cleanup-delete')
+    return removed
+  }
+
+  /**
+   * 每日清理：删除已归档/已删除会话的孤儿文件、超过 retentionMs 未更新
+   * 的文件，并在所有会话总大小超过 maxTotalBytes 时按最旧文件优先淘汰。
    * 只处理文件名严格符合会话 id 规则的 JSONL；README、未知文件和
-   * `unattributed` 桶都保留。扫描绝不会让插件激活失败。
+   * `unattributed` 桶都保留。只有拿到权威会话列表时才执行清理。
    * @returns {Promise<void>}
    */
-  async function sweepOrphanLogs() {
-    if (config.persist !== true || config.cleanupOrphans !== true || sweepingOrphans) return
-    sweepingOrphans = true
+  async function sweepLogs() {
+    if (config.persist !== true || config.cleanupLogs !== true || sweepingLogs) return
+    sweepingLogs = true
     try {
       const known = await knownSessionIds()
       if (known === null) return
@@ -904,39 +1330,89 @@ function createRuntime(ctx, config) {
       try {
         entries = await readdir(config.dataDir, { withFileTypes: true })
       } catch (error) {
-        if (error?.code !== 'ENOENT') reportOnce('orphan-readdir', error)
+        if (error?.code !== 'ENOENT') reportOnce('cleanup-readdir', error)
         return
       }
-      for (const entry of entries) {
-        if (entry === null || typeof entry !== 'object' || entry.isFile?.() !== true) continue
-        const name = String(entry.name)
+      const now = Date.now()
+      const retained = []
+      const unusedIndexFiles = new Set()
+      let totalBytes = 0
+      for (const dirent of entries) {
+        if (dirent === null || typeof dirent !== 'object' || dirent.isFile?.() !== true) continue
+        const name = String(dirent.name)
+        if (name.endsWith('.jsonl.idx')) {
+          unusedIndexFiles.add(join(config.dataDir, name))
+          continue
+        }
         if (!name.endsWith('.jsonl')) continue
         const sessionId = name.slice(0, -'.jsonl'.length)
-        if (sessionId === UNATTRIBUTED_SESSION) continue
-        if (!SESSION_ID_PATTERN.test(sessionId) || known.has(sessionId)) continue
-        const activeEntry = sessions.get(sessionId)
-        if (activeEntry !== undefined && activeEntry.pending.size > 0) continue
+        if (!SESSION_ID_PATTERN.test(sessionId)) continue
         const file = join(config.dataDir, name)
-        const pendingWrite = pendingWrites.get(file)
-        if (pendingWrite !== undefined) {
+        const indexFile = sessionIndexFile(sessionId)
+        let info
+        try {
+          info = await stat(file)
+        } catch (error) {
+          if (error?.code !== 'ENOENT') reportOnce(`cleanup-stat:${file}`, error)
+          continue
+        }
+        let indexSize = 0
+        if (unusedIndexFiles.has(indexFile)) {
           try {
-            await pendingWrite
+            const indexInfo = await stat(indexFile)
+            indexSize = typeof indexInfo.size === 'number' ? indexInfo.size : 0
+            unusedIndexFiles.delete(indexFile)
           } catch {
-            /* 追加失败已经上报过 */
+            /* 索引损坏/缺失时只保留正文大小 */
           }
         }
-        try {
-          await unlink(file)
-          sessions.delete(sessionId)
-          pendingWrites.delete(file)
-        } catch (error) {
-          if (error?.code !== 'ENOENT') reportOnce(`orphan-unlink:${file}`, error)
+        const size = (typeof info.size === 'number' ? info.size : 0) + indexSize
+        const mtimeMs = typeof info.mtimeMs === 'number' ? info.mtimeMs : 0
+        if (sessionId === UNATTRIBUTED_SESSION) {
+          totalBytes += size
+          continue
+        }
+        const orphan = !known.has(sessionId)
+        const expired = now - mtimeMs >= config.retentionMs
+        if (orphan || expired) {
+          const removed = await removeLogFile(sessionId, file)
+          if (!removed) totalBytes += size
+          continue
+        }
+        totalBytes += size
+        retained.push({ sessionId, file, size, mtimeMs })
+      }
+      // 没有正文的遗留索引（写入中断或正文已被手工删除）直接回收。
+      for (const indexFile of unusedIndexFiles) {
+        await enqueueFileTask(indexFile, async () => {
+          try {
+            await unlink(indexFile)
+          } catch (error) {
+            if (error?.code !== 'ENOENT') reportOnce(`cleanup-index:${indexFile}`, error)
+          }
+        }, 'cleanup-index')
+      }
+
+      if (config.maxTotalBytes > 0 && totalBytes > config.maxTotalBytes) {
+        retained.sort((left, right) => left.mtimeMs - right.mtimeMs)
+        for (const candidate of retained) {
+          if (totalBytes <= config.maxTotalBytes) break
+          const removed = await removeLogFile(candidate.sessionId, candidate.file)
+          if (removed) totalBytes -= candidate.size
+        }
+        if (totalBytes > config.maxTotalBytes) {
+          reportOnce(
+            'cleanup-total-budget',
+            new Error(
+              `capture directory is ${totalBytes} bytes, above maxTotalBytes ${config.maxTotalBytes}`,
+            ),
+          )
         }
       }
     } catch (error) {
-      reportOnce('orphan-sweep', error)
+      reportOnce('cleanup-sweep', error)
     } finally {
-      sweepingOrphans = false
+      sweepingLogs = false
     }
   }
 
@@ -981,7 +1457,7 @@ function createRuntime(ctx, config) {
    * @returns {object|null} 交换句柄。
    */
   function beginExchange(request) {
-    if (!captureEnabled) return null
+    if (!captureEnabled || clearingAll) return null
     const initiatorId = currentSessionId()
     if (initiatorId === null && config.captureUnattributed !== true) return null
     const sessionId = initiatorId ?? UNATTRIBUTED_SESSION
@@ -990,6 +1466,7 @@ function createRuntime(ctx, config) {
     const record = {
       id: entry.nextId++,
       sessionId,
+      turn: entry.currentTurn,
       startedAt,
       method: request.method,
       url: request.url,
@@ -1014,6 +1491,7 @@ function createRuntime(ctx, config) {
       completedAt: null,
     }
     pushRecord(entry, record)
+    entry.activeExchanges += 1
     const exchange = {
       sessionId,
       entry,
@@ -1023,8 +1501,14 @@ function createRuntime(ctx, config) {
       responseSettled: false,
       failed: false,
       finished: false,
+      generation: entry.generation,
     }
-    startRequestBodyCapture(exchange, request)
+    try {
+      startRequestBodyCapture(exchange, request)
+    } catch (error) {
+      if (entry.activeExchanges > 0) entry.activeExchanges -= 1
+      throw error
+    }
     return exchange
   }
 
@@ -1185,6 +1669,7 @@ function createRuntime(ctx, config) {
   function finalizeExchange(exchange) {
     if (exchange.finished) return
     exchange.finished = true
+    if (exchange.entry.activeExchanges > 0) exchange.entry.activeExchanges -= 1
     const record = exchange.record
     if (typeof record.completedAt !== 'number') record.completedAt = Date.now()
     if (typeof record.completedMs !== 'number') {
@@ -1198,7 +1683,14 @@ function createRuntime(ctx, config) {
       const model = modelFromBody(record.requestBody, record.requestBodyEncoding)
       if (model !== null) record.model = model
     }
-    persistRecord(exchange.sessionId, record)
+    const currentEntry = sessions.get(exchange.sessionId)
+    if (currentEntry !== exchange.entry || currentEntry.generation !== exchange.generation) {
+      // 该交换属于上一轮，新轮次已经开始；从计数中移除且不再落盘。
+      evictedRecords.add(record)
+      return
+    }
+    currentEntry.revision += 1
+    persistRecord(exchange.sessionId, record, exchange.generation, currentEntry)
   }
 
   /* ----------------------------------------------------------------- 路由   */
@@ -1269,18 +1761,38 @@ function createRuntime(ctx, config) {
     const sessionId = url.searchParams.get('sessionId') ?? ''
     if (!SESSION_ID_PATTERN.test(sessionId)) return invalidSessionResponse()
     const entry = await readSession(sessionId)
-    const limit = parseLimit(url.searchParams.get('limit'), config.maxRequestsPerSession)
-    const selected = limit === null ? entry.records.slice() : entry.records.slice(-limit)
+    const limit = parseLimit(url.searchParams.get('limit'), config.maxRequestsPerTurn)
+    const selected = limit === null ? entry.summaries.slice() : entry.summaries.slice(-limit)
+    const summaryBytes = entry.summaries.reduce(
+      (sum, record) =>
+        sum + (Number(record.requestBytes) || 0) + (Number(record.responseBytes) || 0),
+      0,
+    )
+    const fileBytes = await sessionFileBytes(sessionId)
+    const lastId = entry.summaries.length > 0 ? entry.summaries[entry.summaries.length - 1].id : 0
+    const etag = `W/"${sessionId}:${entry.generation}:${entry.revision}:${entry.summaries.length}:${lastId}:${fileBytes ?? 'n'}"`
+    if (request.headers.get('if-none-match') === etag) {
+      return new Response(null, {
+        status: 304,
+        headers: { etag, 'cache-control': 'no-store' },
+      })
+    }
     return jsonResponse({
       sessionId,
-      total: entry.records.length,
-      totalBytes: entry.bytes,
-      fileBytes: await sessionFileBytes(sessionId),
+      total: entry.summaries.length,
+      totalBytes: entry.bytes > 0 ? entry.bytes : summaryBytes,
+      fileBytes,
       dir: config.dataDir,
       persist: config.persist === true,
+      latestTurnOnly: true,
+      retentionMs: config.retentionMs,
+      cleanupIntervalMs: config.cleanupIntervalMs,
+      maxTotalBytes: config.maxTotalBytes,
+      maxRequestsPerTurn: config.maxRequestsPerTurn,
+      maxTurnBytes: config.maxTurnBytes,
       maxLogFileBytes: config.maxLogFileBytes,
       records: selected.map(summarizeRecord),
-    })
+    }, 200, { etag })
   }
 
   /**
@@ -1292,12 +1804,20 @@ function createRuntime(ctx, config) {
    */
   async function sessionFileBytes(sessionId) {
     if (config.persist !== true) return null
-    try {
-      const info = await stat(sessionFile(sessionId))
-      return typeof info.size === 'number' ? info.size : null
-    } catch {
-      return null
+    let total = 0
+    let found = false
+    for (const file of [sessionFile(sessionId), sessionIndexFile(sessionId)]) {
+      try {
+        const info = await stat(file)
+        if (typeof info.size === 'number') {
+          total += info.size
+          found = true
+        }
+      } catch {
+        /* 任一文件不存在时仍返回另一部分的大小 */
+      }
     }
+    return found ? total : null
   }
 
   /**
@@ -1312,8 +1832,24 @@ function createRuntime(ctx, config) {
     const id = Number(url.searchParams.get('id') ?? '')
     if (!Number.isInteger(id) || id < 1) return errorResponse(400, 'id must be a positive integer')
     const entry = await readSession(sessionId)
-    const record = entry.records.find((candidate) => candidate.id === id)
-    if (record === undefined) return errorResponse(404, 'record not found')
+    const part = url.searchParams.get('part') ?? 'full'
+    if (!['full', 'summary', 'meta', 'requestBody', 'responseBody'].includes(part)) {
+      return errorResponse(400, 'unsupported record part')
+    }
+    const summary = entry.summaries.find((candidate) => candidate.id === id)
+    if (summary === undefined) return errorResponse(404, 'record not found')
+    if (part === 'summary') return jsonResponse({ record: summarizeRecord(summary) })
+
+    let record = entry.records.find((candidate) => candidate.id === id)
+    if (record === undefined) {
+      record = await readRecordAt(sessionId, summary)
+      if (record === null) return errorResponse(404, 'record body is unavailable')
+      // 不把冷读详情塞回内存桶：详情是单次查看，避免用户点开很多记录后
+      // 又把整份大报文长期留在宿主内存里。
+    }
+    if (part === 'meta') return jsonResponse({ record: recordMeta(record) })
+    if (part === 'requestBody') return jsonResponse({ part: recordBodyPart(record, 'request') })
+    if (part === 'responseBody') return jsonResponse({ part: recordBodyPart(record, 'response') })
     return jsonResponse({ record: detailRecord(record) })
   }
 
@@ -1336,6 +1872,16 @@ function createRuntime(ctx, config) {
   }
 
   /**
+   * `POST /clear-all` → 清空所有会话的抓包记录与数据目录中的 JSONL 文件。
+   * 不读取请求输入；README 与未知文件保留。
+   * @returns {Promise<Response>}
+   */
+  async function handleClearAllRequest() {
+    const result = await clearAllSessions()
+    return jsonResponse({ ok: true, ...result })
+  }
+
+  /**
    * `GET /har` → 下载 HAR 1.2 归档。
    * @param {Request} request - 路由请求。
    * @returns {Promise<Response>}
@@ -1345,11 +1891,12 @@ function createRuntime(ctx, config) {
     const sessionId = url.searchParams.get('sessionId') ?? ''
     if (!SESSION_ID_PATTERN.test(sessionId)) return invalidSessionResponse()
     const entry = await readSession(sessionId)
+    const records = await loadSessionRecords(sessionId, entry)
     const har = {
       log: {
         version: '1.2',
         creator: { ...HAR_CREATOR },
-        entries: entry.records.map(toHarEntry),
+        entries: records.map(toHarEntry),
       },
     }
     return new Response(JSON.stringify(har), { headers: HAR_RESPONSE_HEADERS })
@@ -1387,9 +1934,9 @@ function createRuntime(ctx, config) {
    */
   function openDirectoryCommand() {
     if (config.openDirectoryCommand !== '') return config.openDirectoryCommand
+    if (isWslEnvironment()) return 'explorer.exe'
     if (process.platform === 'darwin') return 'open'
     if (process.platform === 'win32') return 'explorer.exe'
-    if (isWslEnvironment()) return 'explorer.exe'
     return 'xdg-open'
   }
 
@@ -1456,18 +2003,21 @@ function createRuntime(ctx, config) {
     const candidates = []
     if (config.openDirectoryCommand !== '') {
       candidates.push({ command: config.openDirectoryCommand, args: [dir] })
-    } else if (process.platform === 'darwin') {
-      candidates.push({ command: 'open', args: [dir] })
-    } else if (process.platform === 'win32') {
-      candidates.push({ command: 'explorer.exe', args: [dir] })
     } else if (isWslEnvironment()) {
+      // WSL 必须优先于 process.platform 判断：它可能上报 linux；测试也会
+      // 在非 Linux 主机上注入 WSL 环境变量来验证 Windows 路径转换。
       const windowsDir = await resolveWslWindowsDirectory(dir)
       candidates.push({ command: openDirectoryCommand(), args: [windowsDir] })
+
       // 某些 WSL 配置不会把 Windows PATH 注入 Linux；直接调用挂载盘里的
       // explorer.exe 仍能通过 WSL interop 打开 \\wsl.localhost\... 路径。
       candidates.push({ command: '/mnt/c/Windows/explorer.exe', args: [windowsDir] })
       candidates.push({ command: 'wslview', args: [dir] })
       candidates.push({ command: 'xdg-open', args: [dir] })
+    } else if (process.platform === 'darwin') {
+      candidates.push({ command: 'open', args: [dir] })
+    } else if (process.platform === 'win32') {
+      candidates.push({ command: 'explorer.exe', args: [dir] })
     } else {
       candidates.push({ command: 'xdg-open', args: [dir] })
     }
@@ -1571,6 +2121,11 @@ function createRuntime(ctx, config) {
         if (exchange !== null) handleResponse(exchange, response)
       } catch (error) {
         reportOnce('response', error)
+        try {
+          if (exchange !== null) handleFailure(exchange, error)
+        } catch (captureError) {
+          reportOnce('response-failure', captureError)
+        }
       }
       try {
         if (response.body !== null && !requestsByBody.has(response.body)) {
@@ -1607,11 +2162,22 @@ function createRuntime(ctx, config) {
     { path: ROUTE_PATHS.records, methods: ['GET', 'HEAD'], handler: handleRecordsRequest },
     { path: ROUTE_PATHS.record, methods: ['GET', 'HEAD'], handler: handleRecordRequest },
     { path: ROUTE_PATHS.clear, methods: ['POST'], handler: handleClearRequest },
+    { path: ROUTE_PATHS.clearAll, methods: ['POST'], handler: handleClearAllRequest },
     { path: ROUTE_PATHS.har, methods: ['GET', 'HEAD'], handler: handleHarRequest },
     { path: ROUTE_PATHS.reveal, methods: ['POST'], handler: handleRevealRequest },
   ]
 
-  return { install, registerRoute, routes, writeDirectoryMarker, sweepOrphanLogs, cleanupOrphans: config.cleanupOrphans && config.persist, orphanSweepIntervalMs: config.orphanSweepIntervalMs }
+  return {
+    install,
+    registerRoute,
+    routes,
+    writeDirectoryMarker,
+    handleSessionEvent,
+    sweepLogs,
+    reportError: reportOnce,
+    cleanupLogs: config.cleanupLogs && config.persist,
+    cleanupIntervalMs: config.cleanupIntervalMs,
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1876,6 +2442,46 @@ function summarizeRecord(record) {
 }
 
 /**
+ * 详情元数据：概览字段 + 头部，不含大 body。
+ * @param {object} record - 内部记录。
+ * @returns {object}
+ */
+function recordMeta(record) {
+  return {
+    ...summarizeRecord(record),
+    requestHeaders: Array.isArray(record.requestHeaders) ? record.requestHeaders : [],
+    responseHeaders: Array.isArray(record.responseHeaders) ? record.responseHeaders : [],
+    responseMimeType: typeof record.responseMimeType === 'string' ? record.responseMimeType : '',
+  }
+}
+
+/**
+ * 按需返回一侧 body。客户端只在用户展开对应区块时请求。
+ * @param {object} record - 内部记录。
+ * @param {'request'|'response'} side - 请求或响应侧。
+ * @returns {object}
+ */
+function recordBodyPart(record, side) {
+  const request = side === 'request'
+  return {
+    side,
+    body: request
+      ? (typeof record.requestBody === 'string' ? record.requestBody : null)
+      : (typeof record.responseBody === 'string' ? record.responseBody : null),
+    encoding: request
+      ? (record.requestBodyEncoding === 'base64' ? 'base64' : 'utf8')
+      : (record.responseBodyEncoding === 'base64' ? 'base64' : 'utf8'),
+    truncated: request ? record.requestTruncated === true : record.responseTruncated === true,
+    bytes: request ? (record.requestBytes ?? 0) : (record.responseBytes ?? 0),
+    mimeType: request
+      ? (Array.isArray(record.requestHeaders)
+          ? (record.requestHeaders.find(([name]) => String(name).toLowerCase() === 'content-type')?.[1] ?? '')
+          : '')
+      : (typeof record.responseMimeType === 'string' ? record.responseMimeType : ''),
+  }
+}
+
+/**
  * 按契约投影为详情：概要加上头部与捕获的响应体。
  * @param {object} record - 内部记录。
  * @returns {object}
@@ -2023,8 +2629,11 @@ function parseLimit(raw, max) {
  * @param {number} [status] - HTTP 状态码。
  * @returns {Response}
  */
-function jsonResponse(payload, status = 200) {
-  return new Response(JSON.stringify(payload), { status, headers: JSON_RESPONSE_HEADERS })
+function jsonResponse(payload, status = 200, extraHeaders = undefined) {
+  const headers = extraHeaders === undefined
+    ? JSON_RESPONSE_HEADERS
+    : { ...JSON_RESPONSE_HEADERS, ...extraHeaders }
+  return new Response(JSON.stringify(payload), { status, headers })
 }
 
 /**

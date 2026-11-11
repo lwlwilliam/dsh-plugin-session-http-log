@@ -2,8 +2,8 @@
  * Lead-owned Host smoke test for the dsh-plugin-session-http-log bundle.
  *
  * Runs the real `index.js` plugin against a fake Cordis context and a local
- * node:http server, then asserts the raw-capture behavior and the four
- * authenticated routes from CONTRACT.md.
+ * node:http server, then asserts raw capture, latest-turn retention, cleanup,
+ * and the authenticated routes from CONTRACT.md.
  *
  *   node test/host-smoke.mjs
  *
@@ -12,7 +12,7 @@
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { strict as assert } from 'node:assert'
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rename, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const { apply } = await import(new URL('../index.js', import.meta.url).href)
@@ -21,6 +21,7 @@ const originalFetch = globalThis.fetch
 let initiator = { id: 'session-test' }
 const routes = new Map()
 const cleanups = []
+const sessionEventListeners = new Set()
 const warnings = []
 let knownSessionIds = new Set(['session-test', 'session-evict', 'session-marker'])
 let sessionParents = new Map()
@@ -63,6 +64,11 @@ const fakeCtx = {
     return undefined
   },
   connection: connectionFace,
+  on(event, listener) {
+    if (event !== 'session/event') return () => {}
+    sessionEventListeners.add(listener)
+    return () => { sessionEventListeners.delete(listener) }
+  },
   effect(callback) {
     const cleanup = callback()
     if (typeof cleanup === 'function') cleanups.push(cleanup)
@@ -122,6 +128,12 @@ const server = createServer(async (req, res) => {
     res.end(Buffer.from([0, 1, 2, 255, 254]))
     return
   }
+  if (req.url.startsWith('/slow')) {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.write('{"slow":')
+    setTimeout(() => res.end('true}'), 80)
+    return
+  }
   res.writeHead(404).end()
 })
 server.listen(0, '127.0.0.1')
@@ -131,7 +143,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 // ── install the plugin under test ───────────────────────────────────────────
 apply(fakeCtx, config)
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed')
-assert.equal(routes.size, 5, `expected 5 routes, got ${[...routes.keys()].join(', ')}`)
+assert.equal(routes.size, 6, `expected 6 routes, got ${[...routes.keys()].join(', ')}`)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const route = (path) => {
@@ -139,15 +151,20 @@ const route = (path) => {
   assert.ok(entry, `route ${path} registered`)
   return entry
 }
-const callRoute = async (path, { method = 'GET', query = '', body } = {}) => {
+const callRoute = async (path, { method = 'GET', query = '', body, headers = {} } = {}) => {
   const entry = route(path)
   const url = `${base}${entry.path}${query}`
   const request = new Request(url, {
     method,
-    ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } }),
+    headers: {
+      ...headers,
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   const response = await entry.fetch(request)
-  return { status: response.status, headers: response.headers, json: await response.json() }
+  const text = await response.text()
+  return { status: response.status, headers: response.headers, json: text === '' ? null : JSON.parse(text) }
 }
 const waitFor = async (check, label, timeoutMs = 3000) => {
   const started = Date.now()
@@ -157,6 +174,10 @@ const waitFor = async (check, label, timeoutMs = 3000) => {
     if (Date.now() - started > timeoutMs) throw new Error(`timeout waiting for ${label}`)
     await sleep(25)
   }
+}
+
+const emitSessionEvent = (session, event) => {
+  for (const listener of [...sessionEventListeners]) listener(session, event)
 }
 
 // 1. raw LLM exchange, observed while the caller streams normally.
@@ -187,12 +208,23 @@ assert.equal(summary.sessionId, 'session-test')
 assert.ok(summary.durationMs >= 0, 'headers duration recorded')
 assert.ok(summary.responseBytes > 0, 'response bytes recorded')
 
-const feed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })).json
+const feedResponse = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-test' })
+const feed = feedResponse.json
 assert.ok(feed.totalBytes > 0, 'session total stored bytes reported')
 assert.equal(feed.fileBytes, null, 'no persisted file size when persistence is off')
 assert.equal(feed.dir, dataDir, 'data directory reported')
 assert.equal(feed.persist, false, 'persistence flag reported')
-assert.equal(feed.maxLogFileBytes, 8 * 1024 * 1024, 'per-session disk cap reported')
+assert.equal(feed.maxLogFileBytes, 8 * 1024 * 1024, 'per-turn disk cap reported')
+assert.equal(feed.latestTurnOnly, true, 'latest-turn retention reported')
+assert.equal(feed.retentionMs, 24 * 60 * 60 * 1000, 'retention window reported')
+assert.equal(typeof feed.maxTotalBytes, 'number', 'global disk cap reported')
+const feedEtag = feedResponse.headers.get('etag')
+assert.ok(typeof feedEtag === 'string' && feedEtag.length > 0, 'records response has an ETag')
+const notModified = await callRoute('/api/dsh-plugin-session-http-log/records', {
+  query: '?sessionId=session-test',
+  headers: { 'if-none-match': feedEtag },
+})
+assert.equal(notModified.status, 304, 'unchanged records response returns 304')
 
 const detail = await callRoute('/api/dsh-plugin-session-http-log/record', {
   query: `?sessionId=session-test&id=${summary.id}`,
@@ -207,6 +239,23 @@ const authHeader = record.requestHeaders.find(([name]) => name === 'authorizatio
 assert.deepEqual(authHeader, ['authorization', '[redacted]'], 'sensitive header redacted')
 const providerHeader = record.responseHeaders.find(([name]) => name === 'x-provider-request-id')
 assert.equal(providerHeader?.[1], 'req-123', 'response headers captured')
+
+const metaResponse = await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: `?sessionId=session-test&id=${summary.id}&part=meta`,
+})
+const metaRecord = metaResponse.json.record
+assert.equal(metaRecord.requestBody, undefined, 'meta part omits request body')
+assert.equal(metaRecord.responseBody, undefined, 'meta part omits response body')
+assert.ok(Array.isArray(metaRecord.requestHeaders), 'meta part keeps headers')
+const requestBodyPart = (await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: `?sessionId=session-test&id=${summary.id}&part=requestBody`,
+})).json.part
+assert.equal(requestBodyPart.body, llmBody, 'request body part loads only that body')
+assert.equal(requestBodyPart.encoding, 'utf8')
+const responseBodyPart = (await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: `?sessionId=session-test&id=${summary.id}&part=responseBody`,
+})).json.part
+assert.ok(responseBodyPart.body.includes('data: [DONE]'), 'response body part loads only that body')
 
 // 2. JSON exchange + binary response + POST route with a body.
 await (await globalThis.fetch(`${base}/json`, {
@@ -320,7 +369,7 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after WSL reveal r
 assert.equal(routes.size, 0, 'routes removed after WSL reveal run')
 
 // 8. byte budget: oldest records are evicted once stored body bytes exceed maxSessionBytes.
-apply(fakeCtx, { ...config, maxSessionBytes: 2048, maxRequestsPerSession: 50 })
+apply(fakeCtx, { ...config, maxTurnBytes: 2048, maxRequestsPerTurn: 50 })
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed again')
 initiator = { id: 'session-evict' }
 const payload = 'x'.repeat(512)
@@ -358,16 +407,179 @@ await waitFor(async () => {
   }
 }, 'data-directory marker')
 const markerText = await readFile(markerPath, 'utf8')
+const markerKeep = join(markerDir, 'keep-me.txt')
+await writeFile(markerKeep, 'keep\n', 'utf8')
 assert.ok(markerText.includes('@local/dsh-plugin-session-http-log'), 'marker names the plugin')
 assert.ok(/uninstall|卸载/i.test(markerText), 'marker explains that uninstalling keeps the data')
 await callRoute('/api/dsh-plugin-session-http-log/clear', { method: 'POST', body: { sessionId: 'session-marker' } })
 await access(markerPath)
 assert.ok(true, 'clearing a session keeps the marker')
 
+// 9b. clear-all removes every session capture file but keeps the directory marker.
+knownSessionIds.add('session-marker-other')
+initiator = { id: 'session-marker' }
+await (await globalThis.fetch(`${base}/json`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: '{"marker":"main"}',
+})).text()
+initiator = { id: 'session-marker-other' }
+await (await globalThis.fetch(`${base}/json`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: '{"marker":"other"}',
+})).text()
+await waitFor(async () => {
+  try {
+    await access(join(markerDir, 'session-marker.jsonl'))
+    await access(join(markerDir, 'session-marker-other.jsonl'))
+    return true
+  } catch {
+    return false
+  }
+}, 'clear-all fixture files')
+const [clearedAll, clearedAllAgain] = await Promise.all([
+  callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
+  callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
+])
+assert.equal(clearedAll.status, 200)
+assert.equal(clearedAllAgain.status, 200)
+assert.equal(clearedAll.json.ok, true)
+assert.equal(clearedAllAgain.json.ok, true)
+assert.ok(clearedAll.json.removedSessions >= 2, 'clear-all reports sessions')
+assert.ok(clearedAll.json.removedFiles >= 2, 'clear-all reports files')
+for (const id of ['session-marker', 'session-marker-other']) {
+  try {
+    await access(join(markerDir, `${id}.jsonl`))
+    assert.fail(`${id} capture file should be deleted by clear-all`)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+}
+await access(markerPath)
+await access(markerKeep)
+assert.equal((await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-marker' })).json.total, 0)
+
 for (const cleanup of cleanups.splice(0)) cleanup()
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after marker run')
 assert.equal(routes.size, 0, 'routes removed after marker run')
 await rm(markerDir, { recursive: true, force: true })
+
+// 9c. cold list reads the lightweight index; detail is loaded lazily by offset.
+const lazyDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-lazy-'))
+knownSessionIds.add('session-lazy')
+workspaceRegistry.archivedSessionIds = []
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: lazyDir,
+  cleanupLogs: false,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for lazy-index run')
+initiator = { id: 'session-lazy' }
+for (const body of ['{"lazy":1}', '{"lazy":2}']) {
+  await (await globalThis.fetch(`${base}/json`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })).text()
+}
+const lazyFile = join(lazyDir, 'session-lazy.jsonl')
+const lazyIndex = join(lazyDir, 'session-lazy.jsonl.idx')
+await waitFor(async () => {
+  try {
+    const indexText = await readFile(lazyIndex, 'utf8')
+    return indexText.trim().split('\n').length === 2 ? true : null
+  } catch {
+    return null
+  }
+}, 'lazy index written')
+const lazyIndexText = await readFile(lazyIndex, 'utf8')
+assert.ok(!lazyIndexText.includes('requestBody'), 'index does not duplicate raw request bodies')
+assert.ok(!lazyIndexText.includes('responseBody'), 'index does not duplicate raw response bodies')
+const lazyFirstFeed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-lazy' })).json
+const lazyFirstId = lazyFirstFeed.records[0].id
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after lazy-index capture')
+assert.equal(routes.size, 0, 'routes removed after lazy-index capture')
+
+const savedBody = join(lazyDir, 'session-lazy.body.saved')
+await rename(lazyFile, savedBody)
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: lazyDir,
+  cleanupLogs: false,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for cold lazy-index run')
+const lazyColdFeed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-lazy' })).json
+assert.equal(lazyColdFeed.total, 2, 'cold list loads summaries without the body file')
+assert.deepEqual(lazyColdFeed.records.map((record) => record.id), [lazyFirstId, lazyFirstId + 1])
+await rename(savedBody, lazyFile)
+const lazyDetail = (await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: `?sessionId=session-lazy&id=${lazyFirstId}`,
+})).json.record
+assert.equal(lazyDetail.requestBody, '{"lazy":1}', 'detail is read lazily from its indexed byte offset')
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after cold lazy-index run')
+assert.equal(routes.size, 0, 'routes removed after cold lazy-index run')
+await rm(lazyDir, { recursive: true, force: true })
+
+// 9d. a legacy JSONL without an index is parsed once, then gets an index.
+const legacyDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-legacy-'))
+knownSessionIds.add('session-legacy')
+workspaceRegistry.archivedSessionIds = []
+const legacyRecords = [1, 2].map((id) => ({
+  id,
+  sessionId: 'session-legacy',
+  turn: 1,
+  startedAt: Date.now(),
+  method: 'POST',
+  url: `${base}/json`,
+  status: 201,
+  statusText: 'Created',
+  durationMs: 1,
+  completedMs: 2,
+  requestBytes: 10,
+  responseBytes: 20,
+  requestTruncated: false,
+  responseTruncated: false,
+  kind: 'http',
+  model: null,
+  error: null,
+  requestHeaders: [],
+  requestBody: JSON.stringify({ legacy: id }),
+  requestBodyEncoding: 'utf8',
+  responseHeaders: [],
+  responseMimeType: 'application/json',
+  responseBody: JSON.stringify({ ok: id }),
+  responseBodyEncoding: 'utf8',
+  completedAt: Date.now(),
+}))
+await writeFile(
+  join(legacyDir, 'session-legacy.jsonl'),
+  legacyRecords.map((record) => JSON.stringify(record)).join('\n') + '\n',
+  'utf8',
+)
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: legacyDir,
+  cleanupLogs: false,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for legacy-index run')
+const legacyFeed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-legacy' })).json
+assert.equal(legacyFeed.total, 2, 'legacy JSONL is readable')
+const legacyIndexPath = join(legacyDir, 'session-legacy.jsonl.idx')
+await access(legacyIndexPath)
+const legacyDetail = (await callRoute('/api/dsh-plugin-session-http-log/record', {
+  query: '?sessionId=session-legacy&id=2',
+})).json.record
+assert.equal(legacyDetail.requestBody, '{"legacy":2}', 'legacy detail is served by indexed offset')
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after legacy-index run')
+assert.equal(routes.size, 0, 'routes removed after legacy-index run')
+await rm(legacyDir, { recursive: true, force: true })
 
 // 10. maxLogFileBytes rotates only the oversized session file, retaining a
 // recent tail instead of discarding every prior in-memory record.
@@ -412,7 +624,139 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after trim run')
 assert.equal(routes.size, 0, 'routes removed after trim run')
 await rm(trimDir, { recursive: true, force: true })
 
-// 11. orphan sweep removes unknown + archived session files, keeps valid ones.
+// 11. latest-turn retention clears the previous turn on turn/start.
+const turnDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-turn-'))
+knownSessionIds.add('session-turn')
+workspaceRegistry.archivedSessionIds = []
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: turnDir,
+  cleanupLogs: false,
+})
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for turn run')
+initiator = { id: 'session-turn' }
+await (await globalThis.fetch(`${base}/json`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: '{"turn":"first"}',
+})).text()
+await waitFor(async () => {
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-turn' })
+  return result.json.records.length === 1
+}, 'first turn captured')
+emitSessionEvent({ id: 'session-turn' }, { type: 'turn/start', data: { turn: 2 } })
+await waitFor(async () => {
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-turn' })
+  return result.json.total === 0
+}, 'previous turn cleared from memory')
+await (await globalThis.fetch(`${base}/json`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: '{"turn":"second"}',
+})).text()
+const turnFeed = await waitFor(async () => {
+  const result = await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-turn' })
+  return result.json.total === 1 ? result.json : null
+}, 'second turn captured')
+assert.equal(turnFeed.records[0].status, 201)
+const turnFile = join(turnDir, 'session-turn.jsonl')
+const turnText = await waitFor(async () => {
+  const text = await readFile(turnFile, 'utf8')
+  return text.includes('second') ? text : null
+}, 'second turn persisted')
+assert.ok(!turnText.includes('first'), 'previous turn is not present in the rewritten file')
+
+// A response still streaming when the next turn starts must not reappear.
+const staleResponse = globalThis.fetch(`${base}/slow`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: '{"turn":"stale"}',
+})
+await sleep(20)
+emitSessionEvent({ id: 'session-turn' }, { type: 'turn/start', data: { turn: 3 } })
+assert.equal(await (await staleResponse).text(), '{"slow":true}')
+await sleep(120)
+const staleFeed = (await callRoute('/api/dsh-plugin-session-http-log/records', { query: '?sessionId=session-turn' })).json
+assert.equal(staleFeed.total, 0, 'in-flight capture from the previous turn is discarded')
+await waitFor(async () => {
+  const text = await readFile(turnFile, 'utf8')
+  return text === '' ? true : null
+}, 'turn reset truncates persisted file')
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after turn run')
+assert.equal(routes.size, 0, 'routes removed after turn run')
+await rm(turnDir, { recursive: true, force: true })
+
+// 12. daily cleanup removes expired files, keeps fresh files, and enforces the global cap.
+const ttlDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-ttl-'))
+knownSessionIds = new Set(['session-fresh', 'session-expired', 'session-newer', 'session-older'])
+workspaceRegistry.archivedSessionIds = []
+const ttlExpired = join(ttlDir, 'session-expired.jsonl')
+const ttlFresh = join(ttlDir, 'session-fresh.jsonl')
+await writeFile(ttlExpired, '{}\n', 'utf8')
+await writeFile(ttlFresh, '{}\n', 'utf8')
+const oldMtime = new Date(Date.now() - 60 * 60 * 1000)
+const freshAtime = new Date()
+await utimes(ttlExpired, freshAtime, oldMtime)
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: ttlDir,
+  retentionMs: 1000,
+  cleanupLogs: true,
+  cleanupIntervalMs: 25,
+  maxTotalBytes: 0,
+})
+await waitFor(async () => {
+  try {
+    await access(ttlExpired)
+    return false
+  } catch {
+    return true
+  }
+}, 'expired capture cleanup')
+await access(ttlFresh)
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after TTL run')
+assert.equal(routes.size, 0, 'routes removed after TTL run')
+await rm(ttlDir, { recursive: true, force: true })
+
+const quotaDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-quota-'))
+knownSessionIds = new Set(['session-older', 'session-newer'])
+workspaceRegistry.archivedSessionIds = []
+const quotaOlder = join(quotaDir, 'session-older.jsonl')
+const quotaNewer = join(quotaDir, 'session-newer.jsonl')
+await writeFile(quotaOlder, 'x'.repeat(64) + '\n', 'utf8')
+await writeFile(quotaNewer, 'y'.repeat(64) + '\n', 'utf8')
+const oldQuota = new Date(Date.now() - 60 * 1000)
+const newQuota = new Date(Date.now() - 30 * 1000)
+await utimes(quotaOlder, oldQuota, oldQuota)
+await utimes(quotaNewer, newQuota, newQuota)
+apply(fakeCtx, {
+  ...config,
+  persist: true,
+  dataDir: quotaDir,
+  retentionMs: 60 * 60 * 1000,
+  cleanupLogs: true,
+  cleanupIntervalMs: 25,
+  maxTotalBytes: 80,
+})
+await waitFor(async () => {
+  try {
+    await access(quotaOlder)
+    return false
+  } catch {
+    return true
+  }
+}, 'global quota eviction')
+await access(quotaNewer)
+for (const cleanup of cleanups.splice(0)) cleanup()
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after quota run')
+assert.equal(routes.size, 0, 'routes removed after quota run')
+await rm(quotaDir, { recursive: true, force: true })
+
+// 13. orphan sweep removes unknown + archived session files, keeps valid ones.
 const orphanDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-orphan-'))
 knownSessionIds = new Set(['session-keep', 'session-archived', 'session-team-child'])
 sessionParents = new Map([['session-team-child', 'session-archived']])
@@ -449,4 +793,4 @@ await rm(orphanDir, { recursive: true, force: true })
 server.close()
 await once(server, 'close')
 await rm(dataDir, { recursive: true, force: true })
-console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, rotation, orphan cleanup, dispose)')
+console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, latest-turn, lazy-index, ETag, TTL, quota, clear-all, rotation, orphan cleanup, dispose)')

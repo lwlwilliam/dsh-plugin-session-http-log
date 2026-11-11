@@ -71,19 +71,24 @@
 schemastery，不导出 `Config`）：
 
 ```
-maxRequestsPerSession: 500
-maxSessionBytes:      32 * 1024 * 1024  // 安全阀：按已存报文字节淘汰最旧记录
+maxRequestsPerTurn:   200               // 当前轮内存条数上限
+maxTurnBytes:         16 * 1024 * 1024  // 当前轮内存字节安全阀
 maxRequestBodyBytes:  2 * 1024 * 1024
 maxResponseBodyBytes: 4 * 1024 * 1024
 redactSensitiveHeaders: true
 persist: true
 dataDir: ''            // 默认：$DSH_HOME/session-http-log（回退 ~/.dsh/session-http-log）
-maxLogFileBytes: 8 * 1024 * 1024    // 单会话磁盘上限；达到后只重写本会话并保留最近尾部
-cleanupOrphans: true                // 定时删除已归档/已删除会话的孤儿 JSONL
-orphanSweepIntervalMs: 60 * 1000    // 孤儿扫描间隔；启动后约 1 秒先扫一次
+maxLogFileBytes: 8 * 1024 * 1024    // 当前轮磁盘上限；达到后只重写本文件并保留最近尾部
+retentionMs: 24 * 60 * 60 * 1000    // 最后写入后保留多久；每日清理时删除超期文件
+cleanupLogs: true                   // 每日清理孤儿/归档、过期文件与全局总容量
+cleanupIntervalMs: 24 * 60 * 60 * 1000 // 每日扫描；启动后约 1 秒先扫一次
+maxTotalBytes: 512 * 1024 * 1024    // 所有文件总磁盘安全阀；0 关闭
 captureUnattributed: false          // 为 true 时，无 initiator 的请求记入 "unattributed"
 openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe / xdg-open）
 ```
+
+旧配置名 `maxRequestsPerSession`、`maxSessionBytes`、`cleanupOrphans`、
+`orphanSweepIntervalMs` 作为别名读取；新代码使用上表的新名称。
 
 1. **安装 fetch 观测器**（放在一个 `ctx.effect(() => { install(); return stop })` 中）。
    - 保存 `const previous = globalThis.fetch`（及其属性描述符），安装 `observedFetch`；
@@ -113,27 +118,61 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
    - 观测器的任何异常都不能进入被包装的调用：每步 try/catch，同一错误只通过
      `ctx.logger?.warn?.()` 告警一次。
 
-2. **存储**
-   - `Map<sessionId, { nextId, records: Record[], bytes, loadedFromDisk }>`；记录按
-     `maxRequestsPerSession` 和 `maxSessionBytes` 双上限淘汰最旧记录（至少保留最新一条）。
-   - 可选持久化：每条完成记录追加一行 JSON 到 `<dataDir>/<清洗后的 sessionId>.jsonl`
-     （递归建目录；同一 session 串行追加；fire-and-forget 且捕获错误）。单文件达到
-     `maxLogFileBytes` 时只重写该会话文件，保留最近约 1/4 上限的已完成记录（至少保留当前记录），
-     不影响其它会话。首次读取某会话且内存为空时，从文件加载最后
-     `maxRequestsPerSession` 条完整行，并按同样的字节预算裁剪。
-   - `clear(sessionId)` 清空内存并删除/清空文件。
+2. **存储与轮次保留**
+   - 监听 `session/event` 的 `turn/start`。该事件属于 Host 已提交事件；收到后按 `session.id`
+     进入新轮次：清空该会话上一轮的内存记录、递增 `generation`，并把文件清空任务排入该文件的
+     串行写队列。上一轮迟到的请求/响应捕获因 `generation` 不匹配而被丢弃，不得重新落盘。
+   - `Map<sessionId, { nextId, records: Record[], bytes, loadedFromDisk, currentTurn, generation }>`；
+     记录按 `maxRequestsPerTurn` 和 `maxTurnBytes` 双上限淘汰最旧记录（至少保留最新一条）。
+     每条内部记录带 `turn`；它不进入前端 summary/detail 投影。
+   - 可选持久化写两个文件：
+     - `<dataDir>/<清洗后的 sessionId>.jsonl`：完整正文；
+     - `<dataDir>/<清洗后的 sessionId>.jsonl.idx`：轻量 summary + 正文 `offset`/`length`。
+     每条完成记录按“正文先写、索引后写”的顺序进入同一文件队列；每行索引不含 body。
+     持久化是 fire-and-forget：抓包 finalize 只入队、不 await 写盘；队列任务先 `setImmediate`
+     让出事件循环，再序列化/写文件。`dispose` 会等待待写队列完成。
+   - 单轮正文文件达到 `maxLogFileBytes` 时重写正文和索引，保留最近约 1/4 上限的已完成记录
+     （至少保留当前记录），不影响其它会话。
+   - 冷读只读 `.jsonl.idx`，按 payload 行偏移懒读取 `/record` 详情；不存在索引的旧版完整
+     JSONL 会在首次冷读时重建一次索引。HAR 导出是唯一会批量读取全部 body 的常规例外。
+   - 列表响应带基于 `generation + revision + 条数 + 最后 id + fileBytes` 的 ETag；
+     `If-None-Match` 命中时返回 304，不重复发送/解析 summary 数组。
+   - 清理必须成对处理正文与索引；索引无正文时单独回收。
+   - `clear(sessionId)` 清空内存并删除/清空文件；仍保留手动“打开目录”和“清空”能力。
+   - **每日清理**（`cleanupLogs: true` 且 `persist: true`，启动后约 1 秒先扫一次，之后按
+     `cleanupIntervalMs`，默认 24 小时）：
+     - 只处理文件名符合会话 id 规则的 `*.jsonl` 及其成对 `.jsonl.idx`；`README.txt`、
+       未知文件与 `unattributed.jsonl` 不删除。
+     - 会话不在 live Session / `sessionPersistence`，或处于归档集合时，删除对应文件；
+       父会话清理时沿 `parentSession` 链清理子会话。
+     - 文件 `mtime` 距当前时间达到 `retentionMs` 时删除。由于每日扫描，实际过期时间可为
+       24–48 小时，README 必须说明这一点。
+     - 所有保留文件总大小超过 `maxTotalBytes`（>0 时）则按 `mtime` 最旧优先删整个会话文件。
+     - 进行中捕获（`pending.size > 0`）或该文件仍在写队列时跳过删除；删除后同步失效对应内存桶。
+     - 读不到权威会话列表时整轮跳过，绝不猜测性删除。
 
 3. **HTTP 路由**（每个都在 `ctx.effect(...)` 中注册并返回 disposer；`requestBody:'buffered'`）。
    所有响应都是 `new Response(JSON.stringify(x), { headers: { 'content-type':
    'application/json; charset=utf-8', 'cache-control': 'no-store' } })`；错误返回 4xx/5xx
    JSON `{ error: string }`。`sessionId` 用 `/^[A-Za-z0-9._-]{1,200}$/` 校验。
    - `GET /api/dsh-plugin-session-http-log/records?sessionId=…&limit=…`
-     → `{ sessionId, total, totalBytes, fileBytes, dir, persist, maxLogFileBytes,
-     records: RecordSummary[] }`（最新在后，summary 不含报文；`totalBytes` = 估算已存字节，
-     `fileBytes` = JSONL 文件大小或 null，`dir` = 持久化目录，`persist` = 是否持久化，
-     `maxLogFileBytes` = 单会话磁盘上限）
-   - `GET /api/dsh-plugin-session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404
+     → `{ sessionId, total, totalBytes, fileBytes, dir, persist, latestTurnOnly,
+     retentionMs, cleanupIntervalMs, maxTotalBytes, maxRequestsPerTurn, maxTurnBytes,
+     maxLogFileBytes, records: RecordSummary[] }`（最新在后，summary 不含报文；
+     `totalBytes` = 估算已存字节，`fileBytes` = JSONL 文件大小或 null，`dir` = 持久化目录，
+     `persist` = 是否持久化，`latestTurnOnly` 固定为 true，其余字段回显保留配置）。
+     响应带 `ETag`；请求头 `If-None-Match` 与当前值一致时返回 304 空正文。
+   - `GET /api/dsh-plugin-session-http-log/record?sessionId=…&id=…` → `{ record: Record }` 或 404；
+     支持 `part=summary|meta|requestBody|responseBody`：
+     - `summary` 只从索引返回轻量概览，不读正文文件；
+     - `meta` 返回概览 + 头部，不含 body；
+     - `requestBody` / `responseBody` 只返回对应一侧的 body 载荷。
+     省略 `part` 时保持旧的完整详情行为（HAR/兼容调用仍可用）。
    - `POST /api/dsh-plugin-session-http-log/clear` body `{ "sessionId": "…" }` → `{ ok: true, removed: n }`
+   - `POST /api/dsh-plugin-session-http-log/clear-all` → `{ ok: true, removedSessions, removedRecords, removedFiles }`：
+     清空所有会话内存记录并删除数据目录中所有符合会话 id 规则的 `*.jsonl` 与
+     `.jsonl.idx`；保留 `README.txt` 和未知文件。
+     删除期间暂停新捕获，避免清理与写入竞态。
    - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
      目录（平台默认或 `openDirectoryCommand`）。WSL 下必须把 Linux 路径转换为 Windows 路径
      （优先 `wslpath -w`，回退到 `/mnt/<drive>` 或 `\\wsl.localhost\<distro>`），再交给 Windows
@@ -191,14 +230,17 @@ window.__ModuleLoader__.load({
 - 在命名空间 `dsh-plugin-session-http-log` 下注册 `en` 与 `zh` 字典，所有可见文案都通过
   `ctx.locale.bind(NS)`（用户语言是中文，`zh` 必须完整）；面板内另有中/EN 快捷切换（见下）。
 - 按契约中的片段注册 tab 类型与面板 body；`keepMounted: true`。
-- 数据流：`props.sessionId`；挂载期间每约 1.2 秒轮询
+- 数据流：`props.sessionId`；挂载且面板可见时每约 1.2 秒轮询
   `GET api/dsh-plugin-session-http-log/records?sessionId=…&limit=500`（`credentials: 'same-origin'`，
-  跳过重叠请求，卸载时 abort）；刷新按钮；选中时取详情
-  `GET api/dsh-plugin-session-http-log/record?sessionId=…&id=…`；清空按钮 POST
-  `api/dsh-plugin-session-http-log/clear`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
-- 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空、导出、打开目录）；
-  持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示
-  `maxLogFileBytes` 是单会话磁盘上限、达到后会重写本会话并保留最近记录；不得暗示会清理其它会话。
+  带 `If-None-Match`，304 时不更新状态，跳过重叠请求，卸载/不可见时 abort）；刷新按钮；选中时先取
+  `part=meta` 详情，正文区块展开时才取 `part=requestBody|responseBody`；清空当前会话按钮 POST
+  `api/dsh-plugin-session-http-log/clear`；清空全部按钮在二次确认后 POST
+  `api/dsh-plugin-session-http-log/clear-all`；导出按钮下载 HAR（Blob + 临时 `<a download>`）。
+- 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空当前会话、导出、打开目录）；
+  “清空全部”放在标题栏右侧语言切换旁，二次确认后调用 clear-all；
+  持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示保留策略：
+  只保留最新一轮、单轮 `maxLogFileBytes` 上限、`retentionMs` 过期清理；文案必须说明
+  打开目录、清空当前会话与清空全部功能仍然可用，不得把自动清理描述成只影响一个会话。
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。
 - 行：方法 chip、路径（tooltip 为完整 URL）、按状态着色的状态 chip（2xx success、3xx idle、
@@ -222,8 +264,11 @@ window.__ModuleLoader__.load({
    `fetch(url, { method:'POST', body: JSON.stringify({model:'m'}), headers })`；断言抓到的记录
    含原始请求/响应文本、请求头、计时、`kind:'llm'`；断言 list/detail/clear/HAR/reveal 路由；
    断言字节预算淘汰、单会话超 `maxLogFileBytes` 后旧文件被重写且保留最近尾部并继续写、
-   WSL reveal 把 Windows 路径传给 `explorer.exe`、未知/已归档会话的 JSONL 被孤儿清理且有效
-   文件保留；dispose 后 `globalThis.fetch` 还原。
+   `turn/start` 后上一轮内存和文件被清空且新轮继续写、摘要索引冷读与 `part` 懒加载详情、
+   ETag/304、过期文件清理、`maxTotalBytes` 全局淘汰、`clear-all` 删除全部会话文件但保留
+   `README.txt`、WSL reveal 把 Windows 路径传给
+   `explorer.exe`、未知/已归档会话的 JSONL 被清理且有效文件保留；dispose 后
+   `globalThis.fetch` 还原。
 3. Client 冒烟测试（`test/client-smoke.mjs`）：伪 React + 伪客户端上下文加载真实 `client.js`，
    断言 tab/pane 注册、en/zh 字典完整性、视图渲染、主题 token 使用。
 4. `plugin_manager install_bundle` 安装 bundle，再用 `cordis_inspect_query Config.listConfigs`
