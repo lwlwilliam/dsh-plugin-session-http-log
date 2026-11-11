@@ -125,7 +125,7 @@ window.__ModuleLoader__.load({
       'header.spaceUninstallNote': 'Uninstalling the plugin does not delete this directory.',
       'header.notPersisted': 'not persisted',
       'header.openFolder': 'Open folder',
-      'header.openFolderTitle': 'Open the records directory (uninstalling the plugin does not delete its data)',
+      'header.openFolderTitle': 'Open the records directory and select this session\'s .jsonl log when the file manager supports it; the .idx index sits next to it (uninstalling the plugin does not delete its data)',
       'header.opening': 'Opening…',
       'header.opened': 'Opened',
       'error.reveal': 'Could not open the data directory: {message}',
@@ -227,7 +227,7 @@ window.__ModuleLoader__.load({
       'header.spaceUninstallNote': '卸载插件不会删除该目录。',
       'header.notPersisted': '未持久化',
       'header.openFolder': '打开目录',
-      'header.openFolderTitle': '打开记录保存目录（卸载插件不会自动删除该目录的数据）',
+      'header.openFolderTitle': '打开记录保存目录，并尽量选中本会话的 .jsonl 日志（索引 .jsonl.idx 与它同目录；文件管理器需支持；卸载插件不会自动删除该目录数据）',
       'header.opening': '正在打开…',
       'header.opened': '已打开',
       'error.reveal': '打开数据目录失败：{message}',
@@ -1646,7 +1646,8 @@ window.__ModuleLoader__.load({
           const response = await fetch(ROUTE + '/reveal', {
             method: 'POST',
             credentials: 'same-origin',
-            headers: { accept: 'application/json' },
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
           })
           await readJsonResponse(response)
           setRevealFeedback('opened')

@@ -385,6 +385,9 @@ const wslDataDir = join(wslRoot, 'records')
 const revealCapture = join(wslRoot, 'explorer-args.txt')
 const windowsDir = String.raw`\\wsl.localhost\Ubuntu\home\go\.dsh\session-http-log`
 await mkdir(fakeBin, { recursive: true })
+await mkdir(wslDataDir, { recursive: true })
+await writeFile(join(wslDataDir, 'session-wsl.jsonl'), '{}\n', 'utf8')
+await writeFile(join(wslDataDir, 'session-wsl.jsonl.idx'), '{"id":1}\n', 'utf8')
 const fakeWslpath = join(fakeBin, 'wslpath')
 const fakeExplorer = join(fakeBin, 'explorer.exe')
 await writeFile(fakeWslpath, '#!/bin/sh\nprintf \'%s\\n\' "$DSH_TEST_WINDOWS_DIR"\n', 'utf8')
@@ -417,6 +420,26 @@ try {
     }
   }, 'WSL explorer launch')
   assert.equal(openedTarget, windowsDir, 'WSL reveal passes a Windows path to explorer.exe')
+  // With a session id the handler should ask Explorer to select the session log.
+  const wslSelected = await callRoute('/api/dsh-plugin-session-http-log/reveal', {
+    method: 'POST',
+    body: { sessionId: 'session-wsl' },
+  })
+  assert.equal(wslSelected.status, 200, 'WSL selection reveal responds')
+  assert.deepEqual(
+    wslSelected.json.selected,
+    [join(wslDataDir, 'session-wsl.jsonl')],
+    'WSL selection reveal reports the body file (Explorer selects one item)',
+  )
+  const selectedTarget = await waitFor(async () => {
+    try {
+      const text = (await readFile(revealCapture, 'utf8')).trim()
+      return text.startsWith('/select,') ? text : ''
+    } catch {
+      return ''
+    }
+  }, 'WSL explorer file selection')
+  assert.equal(selectedTarget, `/select,${windowsDir}`, 'WSL reveal asks explorer.exe to select the session log')
 } finally {
   for (const cleanup of cleanups.splice(0)) cleanup()
   for (const [key, value] of Object.entries(savedEnv)) {
@@ -427,6 +450,58 @@ try {
 }
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after WSL reveal run')
 assert.equal(routes.size, 0, 'routes removed after WSL reveal run')
+
+// 7c. Same-platform selection: macOS reveals (-R) the body and index together.
+if (process.platform === 'darwin') {
+  const selectRoot = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-select-'))
+  const selectBin = join(selectRoot, 'bin')
+  const selectDataDir = join(selectRoot, 'records')
+  const openCapture = join(selectRoot, 'open-args.txt')
+  const fakeOpen = join(selectBin, 'open')
+  await mkdir(selectBin, { recursive: true })
+  await mkdir(selectDataDir, { recursive: true })
+  const selectBody = join(selectDataDir, 'session-open.jsonl')
+  const selectIndex = join(selectDataDir, 'session-open.jsonl.idx')
+  await writeFile(selectBody, '{}\n', 'utf8')
+  await writeFile(selectIndex, '{"id":1}\n', 'utf8')
+  await writeFile(fakeOpen, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$DSH_TEST_OPEN_CAPTURE"\n', 'utf8')
+  await chmod(fakeOpen, 0o755)
+  const savedSelectEnv = {
+    PATH: process.env.PATH,
+    DSH_TEST_OPEN_CAPTURE: process.env.DSH_TEST_OPEN_CAPTURE,
+  }
+  process.env.PATH = `${selectBin}:${savedSelectEnv.PATH ?? ''}`
+  process.env.DSH_TEST_OPEN_CAPTURE = openCapture
+  try {
+    apply(fakeCtx, { ...config, persist: true, dataDir: selectDataDir, openDirectoryCommand: '', cleanupLogs: false })
+    assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for macOS selection run')
+    const selected = await callRoute('/api/dsh-plugin-session-http-log/reveal', {
+      method: 'POST',
+      body: { sessionId: 'session-open' },
+    })
+    assert.equal(selected.status, 200, 'macOS selection reveal responds')
+    assert.deepEqual(selected.json.selected, [selectBody], 'selection reveal reports the body file')
+    const argv = await waitFor(async () => {
+      try {
+        const text = (await readFile(openCapture, 'utf8')).trim()
+        return text === '' ? null : text.split('\n')
+      } catch {
+        return null
+      }
+    }, 'macOS open -R launch')
+    assert.equal(argv[0], '-R', 'macOS reveal requests Finder selection')
+    assert.deepEqual(argv.slice(1), [selectBody], 'macOS reveal selects the body file (open -R selects one item)')
+  } finally {
+    for (const cleanup of cleanups.splice(0)) cleanup()
+    for (const [key, value] of Object.entries(savedSelectEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(selectRoot, { recursive: true, force: true })
+  }
+  assert.equal(globalThis.fetch, originalFetch, 'fetch restored after macOS selection run')
+  assert.equal(routes.size, 0, 'routes removed after macOS selection run')
+}
 
 // 8. byte budget: oldest records are evicted once stored body bytes exceed maxSessionBytes.
 apply(fakeCtx, { ...config, maxTurnBytes: 2048, maxRequestsPerTurn: 50 })

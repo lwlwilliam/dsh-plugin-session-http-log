@@ -40,7 +40,7 @@ Harness 的 initiator 链归属到对应会话。
   现存会话和本面板正在查看的会话不受影响；不活跃为 0 时按钮禁用（详见“记录保存在哪”）；
 - 列表行同时显示**请求体（↑）与响应体（↓）**的大小，悬停可看到两者明细；详情概览里另有“合计大小”；
 - 顶部用**加粗警示文字**说明保留策略：每个会话只保留最新一轮；单轮文件达到 `maxLogFileBytes` 后只保留最近记录，超过 `retentionMs` 未更新的文件会在每日清理中删除；
-- 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录；WSL 下会自动转换为 Windows 路径并调用 `explorer.exe`；
+- 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录，并尽量**选中本会话的正文 `.jsonl`**（索引 `.jsonl.idx` 与它同目录并列，打开后一眼可见）：macOS 用 `open -R`；Windows/WSL 用 `explorer.exe /select,`；Linux 依次尝试 Nautilus/Dolphin/Nemo/Thunar 的选中参数，都不支持时只打开目录。这些入口都只能可靠选中**单个**文件（传多个时只有最后一个生效），所以不强制多选。WSL 下会自动转换为 Windows 路径并调用 `explorer.exe`；
 - **筛选** 支持按方法、URL、状态码、模型或类型过滤；
 - **导出 HAR** 会下载 HAR 1.2 文件；**清空** 会删除本会话的内存记录与磁盘文件；
   **清空全部** 会在二次确认后删除所有会话的抓包文件，但保留 `README.txt` 与目录中的未知文件。
@@ -234,7 +234,7 @@ rm -rf <本包目录>                                         # 如不再需要�
   仍在面板里可见，不会被“搬空”。
 - 该目录内还会自动生成一个 `README.txt`，说明这目录的用途以及“卸载插件不会删除本目录”。
 - 面板里的“占用空间”是本会话记录在内存中的估算大小；悬停提示里的“磁盘”是正文和索引文件的
-  合计大小；点击 **打开目录** 可直接定位。
+  合计大小；点击 **打开目录** 可直接定位，并尽量选中该会话的正文文件（索引同目录可见）。
 - 列表请求使用 ETag；内容未变化时服务端返回 304，客户端不会重复解析/刷新整张列表。
 - 面板不可见（切换主视图/侧边栏或浏览器标签页隐藏）时停止轮询并中止在途请求；重新可见后恢复。
 - 日志落盘是 fire-and-forget 的串行异步队列：抓包和对话主流程不 await 写盘；大报文的 JSON
@@ -293,7 +293,7 @@ rm -rf <本包目录>                                         # 如不再需要�
 | `cleanupIntervalMs` | `86400000`（24 小时） | 自动清理扫描间隔；插件启动后约 1 秒还会先扫一次。 |
 | `maxTotalBytes` | `536870912`（512 MiB） | 所有抓包文件的总磁盘安全阀；超出时按最后写入时间最旧优先删除。设为 `0` 可关闭该全局限制。 |
 | `captureUnattributed` | `false` | 为 `true` 时，无法归属到会话的请求也会记录到 `unattributed` 桶。 |
-| `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择：WSL 自动转换路径后用 Windows `explorer.exe`、macOS `open`、Windows `explorer.exe`、其它 Linux `xdg-open`。 |
+| `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择：WSL 自动转换路径后用 Windows `explorer.exe`、macOS `open`、Windows `explorer.exe`、其它 Linux `xdg-open`。设置后只把数据目录作为唯一参数传入，**不会**再尝试选中会话文件。 |
 
 为兼容旧配置，`maxRequestsPerSession`、`maxSessionBytes`、`cleanupOrphans`、
 `orphanSweepIntervalMs` 仍会作为对应新字段的别名读取；新配置建议使用上表字段。

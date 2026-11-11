@@ -19,7 +19,7 @@
  *   GET  /api/dsh-plugin-session-http-log/usage                    → 所有会话抓包文件总大小（含不活跃会话占用）
  *   POST /api/dsh-plugin-session-http-log/clear-inactive           → { ok, removedSessions, removedFiles, freedBytes }
  *   GET  /api/dsh-plugin-session-http-log/har?sessionId            → HAR 1.2 归档
- *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir }（打开数据目录）
+ *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir, selected }（打开数据目录并尽量选中会话日志）
  *
  * @module @local/dsh-plugin-session-http-log
  */
@@ -2074,26 +2074,57 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * `POST /reveal` → 确保配置的数据目录存在，并在
-   * 操作系统文件管理器中打开它。路径始终是 `config.dataDir`；不读取任何请求输入，
-   * 因此该路由绝不可能打开任意位置。
+   * 该会话在磁盘上实际存在的日志文件（正文在前、索引在后）。
+   * @param {string} sessionId - 已验证的会话 id；空串表示不指定会话。
+   * @returns {Promise<string[]>} 绝对路径列表；没有文件时为空数组。
+   */
+  async function existingSessionFiles(sessionId) {
+    if (sessionId === '') return []
+    const files = []
+    for (const file of [sessionFile(sessionId), sessionIndexFile(sessionId)]) {
+      try {
+        const info = await stat(file)
+        if (info.isFile()) files.push(file)
+      } catch {
+        /* 没有该文件（例如尚未落盘或只有一侧）时跳过 */
+      }
+    }
+    return files
+  }
+
+  /**
+   * `POST /reveal` → 确保配置的数据目录存在，并在操作系统文件管理器中打开它。
+   * body 可选 `{ "sessionId": "…" }`：传入时会尽量打开并**选中**该会话的
+   * 日志文件（正文与索引）。路径始终位于 `config.dataDir` 下，且会话 id 经过
+   * 校验，因此该路由绝不可能打开任意位置。
+   * @param {Request} request - 路由请求。
    * @returns {Promise<Response>}
    */
-  async function handleRevealRequest() {
+  async function handleRevealRequest(request) {
     const dir = config.dataDir
+    let sessionId = ''
+    try {
+      const payload = await request.json()
+      const requested = payload !== null && typeof payload === 'object' ? payload.sessionId : undefined
+      if (typeof requested === 'string' && SESSION_ID_PATTERN.test(requested)) sessionId = requested
+    } catch {
+      /* 没有 JSON body：保持旧的“只打开目录”行为 */
+    }
     try {
       await mkdir(dir, { recursive: true })
     } catch (error) {
       reportOnce('reveal-mkdir', error)
       return errorResponse(500, errorMessage(error))
     }
+    let selected = []
     try {
-      await openDirectory(dir)
+      const files = await existingSessionFiles(sessionId)
+      selected = await openDirectory(dir, files)
     } catch (error) {
       reportOnce('reveal-open', error)
       return errorResponse(500, errorMessage(error))
     }
-    return jsonResponse({ ok: true, dir })
+    return jsonResponse({ ok: true, dir, selected })
   }
 
   /**
@@ -2161,15 +2192,25 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * 在系统文件管理器中打开数据目录。
-   * - 普通 Linux：`xdg-open`；
-   * - WSL：把 Linux 路径转成 Windows 路径后交给 `explorer.exe`，
-   *   并在 PATH 中没有 Windows interop 时尝试挂载盘上的 explorer.exe；
-   * - 自定义 `openDirectoryCommand` 时保持原样，只传 Linux 目录。
+   * 在系统文件管理器中打开数据目录，并尽量**选中**这些日志文件中的一个。
+   * 各平台能力不同：`open -R`、`explorer.exe /select,` 以及常见 Linux
+   * 文件管理器的 `--select` 都只能可靠地选中**单个**文件（传多个时只有
+   * 最后一个生效），所以统一选中正文 `.jsonl`；索引与正文同目录并列，
+   * 打开后一眼可见。具体：
+   * - macOS：`open -R <jsonl>`；
+   * - Windows：`explorer.exe /select,<jsonl>`；
+   * - WSL：转换为 Windows 路径后 `explorer.exe /select,<jsonl>`；Explorer
+   *   对 `\\wsl.localhost\...` 的支持因版本而异，失败时回退为打开目录；
+   * - 普通 Linux：依次尝试 nautilus/dolphin/nemo/thunar 的选中参数，
+   *   都不可用时回退 `xdg-open <dir>`（只打开目录）；
+   * - 自定义 `openDirectoryCommand` 时保持旧行为，只传 Linux 目录。
    * @param {string} dir - 要打开的目录（始终是配置的数据目录）。
-   * @returns {Promise<void>}
+   * @param {string[]} [files] - 已存在的日志文件绝对路径，正文在前。
+   * @returns {Promise<string[]>} 实际请求文件管理器选中的文件（为空表示只打开目录）。
    */
-  async function openDirectory(dir) {
+  async function openDirectory(dir, files = []) {
+    const targets = Array.isArray(files) ? files.filter((file) => typeof file === 'string' && file !== '') : []
+    const selection = targets.length > 0 ? [targets[0]] : []
     /** @type {Array<{ command: string, args: string[] }>} */
     const candidates = []
     if (config.openDirectoryCommand !== '') {
@@ -2178,18 +2219,32 @@ function createRuntime(ctx, config) {
       // WSL 必须优先于 process.platform 判断：它可能上报 linux；测试也会
       // 在非 Linux 主机上注入 WSL 环境变量来验证 Windows 路径转换。
       const windowsDir = await resolveWslWindowsDirectory(dir)
-      candidates.push({ command: openDirectoryCommand(), args: [windowsDir] })
+      if (targets.length > 0) {
+        const windowsFile = await resolveWslWindowsDirectory(targets[0])
+        candidates.push({ command: openDirectoryCommand(), args: [`/select,${windowsFile}`] })
 
-      // 某些 WSL 配置不会把 Windows PATH 注入 Linux；直接调用挂载盘里的
-      // explorer.exe 仍能通过 WSL interop 打开 \\wsl.localhost\... 路径。
+        // 某些 WSL 配置不会把 Windows PATH 注入 Linux；直接调用挂载盘里的
+        // explorer.exe 仍能通过 WSL interop 选择 \wsl.localhost\... 下的文件。
+        candidates.push({ command: '/mnt/c/Windows/explorer.exe', args: [`/select,${windowsFile}`] })
+      }
+      candidates.push({ command: openDirectoryCommand(), args: [windowsDir] })
       candidates.push({ command: '/mnt/c/Windows/explorer.exe', args: [windowsDir] })
       candidates.push({ command: 'wslview', args: [dir] })
       candidates.push({ command: 'xdg-open', args: [dir] })
     } else if (process.platform === 'darwin') {
+      if (selection.length > 0) candidates.push({ command: 'open', args: ['-R', selection[0]] })
       candidates.push({ command: 'open', args: [dir] })
     } else if (process.platform === 'win32') {
+      if (targets.length > 0) candidates.push({ command: 'explorer.exe', args: [`/select,${targets[0]}`] })
       candidates.push({ command: 'explorer.exe', args: [dir] })
     } else {
+      if (targets.length > 0) {
+        // 常见 Linux 文件管理器的“打开并选中一个文件”入口；没有的会 ENOENT 跳过。
+        candidates.push({ command: 'nautilus', args: ['--select', targets[0]] })
+        candidates.push({ command: 'dolphin', args: ['--select', targets[0]] })
+        candidates.push({ command: 'nemo', args: [targets[0]] })
+        candidates.push({ command: 'thunar', args: ['--select', targets[0]] })
+      }
       candidates.push({ command: 'xdg-open', args: [dir] })
     }
 
@@ -2197,7 +2252,7 @@ function createRuntime(ctx, config) {
     for (const candidate of candidates) {
       try {
         await spawnDetached(candidate.command, candidate.args)
-        return
+        return selection
       } catch (error) {
         lastError = error
         // 只有“命令不存在”才值得换下一个候选；权限等错误直接上报。

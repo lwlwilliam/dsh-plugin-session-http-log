@@ -193,10 +193,19 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      删除已归档/已删除会话的抓包文件，覆盖所有工作区（`sessionId` 指向的面板会话始终保留）。
      删除复用文件队列与“进行中捕获”保护；会话列表不可用时返回 503 `{ error }`，不执行任何
      删除。并发调用合并为一次执行。
-   - `POST /api/dsh-plugin-session-http-log/reveal` → `{ ok: true, dir }`：在系统文件管理器中打开持久化
-     目录（平台默认或 `openDirectoryCommand`）。WSL 下必须把 Linux 路径转换为 Windows 路径
-     （优先 `wslpath -w`，回退到 `/mnt/<drive>` 或 `\\wsl.localhost\<distro>`），再交给 Windows
-     `explorer.exe`；失败返回 500 `{ error }`。
+   - `POST /api/dsh-plugin-session-http-log/reveal` body 可选 `{ "sessionId": "…" }` →
+     `{ ok: true, dir, selected: string[] }`：在系统文件管理器中打开持久化目录（平台默认或
+     `openDirectoryCommand`），并在平台支持时**选中该会话的日志文件**。`selected` 为实际请求
+     文件管理器选中的路径（最多一个：正文 `.jsonl`；文件不存在时为空数组）。各平台的选择入口
+     （macOS `open -R`、Windows/WSL `explorer.exe /select,`、Linux 文件管理器 `--select`）都只能
+     可靠地选中**单个**文件，传多个时只有最后一个生效，因此统一只选正文，索引与正文同目录并列
+     可见；普通 Linux 依次尝试 `nautilus --select`、`dolphin --select`、`nemo <file>`、
+     `thunar --select`，都不可用时回退 `xdg-open <dir>`（只打开目录）。自定义
+     `openDirectoryCommand` 保持只传目录的旧行为。
+     WSL 下路径必须转换为 Windows 路径（优先 `wslpath -w`，回退到 `/mnt/<drive>` 或
+     `\\wsl.localhost\<distro>`）再交给 Windows `explorer.exe`；Explorer 对 UNC 路径的选择支持
+     因版本而异，失败时回退打开目录。路由只接受通过会话 id 校验的文件名，绝不打开任意位置；
+     失败返回 500 `{ error }`。
    - `GET /api/dsh-plugin-session-http-log/har?sessionId=…` → HAR 1.2 对象
      `{ log: { version: '1.2', creator: { name: 'dsh-plugin-session-http-log', version: '0.1.0' },
      entries: [ … ] } }`；`content-type: application/json`，`content-disposition:
@@ -255,7 +264,9 @@ window.__ModuleLoader__.load({
   带 `If-None-Match`，304 时不更新状态，跳过重叠请求，卸载/不可见时 abort）；刷新按钮；选中时先取
   `part=meta` 详情，正文区块展开时才取 `part=requestBody|responseBody`；清空当前会话按钮 POST
   `api/dsh-plugin-session-http-log/clear`；清空全部按钮在二次确认后 POST
-  `api/dsh-plugin-session-http-log/clear-all`；导出按钮下载 HAR（Blob + 临时 `<a download>`）；
+  `api/dsh-plugin-session-http-log/clear-all`；打开目录按钮 POST
+  `api/dsh-plugin-session-http-log/reveal` 并带 `{ sessionId }`（尽量选中本会话的日志文件）；
+  导出按钮下载 HAR（Blob + 临时 `<a download>`）；
   另以约 8 秒间隔轮询 `GET api/dsh-plugin-session-http-log/usage?sessionId=…` 展示所有会话抓包
   文件的总大小与其中不活跃会话的占用（面板不可见时停止；失败时静默保留上一次值；手动刷新、
   清空当前会话、清空全部、清空不活跃后立即重取）。
@@ -298,8 +309,9 @@ window.__ModuleLoader__.load({
    `README.txt`、`usage` 汇总所有会话文件（关闭持久化时全 0，`clear-all` 后归零且不统计未知文件）、
    `usage` 的不活跃统计只包含已归档/已删除会话（全局）并排除面板会话、
    `clear-inactive` 只删这些文件并保留现存/面板会话、
-   WSL reveal 把 Windows 路径传给
-   `explorer.exe`、未知/已归档会话的 JSONL 被清理且有效文件保留；dispose 后
+   WSL reveal 把 Windows 路径传给 `explorer.exe` 并在带 `sessionId` 时用 `/select,` 选中正文、
+   macOS 的 `open -R` 只接收正文 `.jsonl`、`selected` 只包含真实存在的主文件、
+   未知/已归档会话的 JSONL 被清理且有效文件保留；dispose 后
    `globalThis.fetch` 还原。
 3. Client 冒烟测试（`test/client-smoke.mjs`）：伪 React + 伪客户端上下文加载真实 `client.js`，
    断言 tab/pane 注册、en/zh 字典完整性、视图渲染、主题 token 使用。
