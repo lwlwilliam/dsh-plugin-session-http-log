@@ -7,8 +7,8 @@
 （包括流式 SSE 响应体）、联网搜索/抓取，以及 Agent 工作期间发出的其它 HTTP 请求，都会通过
 Harness 的 initiator 链归属到对应会话。
 
-默认只保留每个会话**最新一轮**的抓包；进入下一轮时上一轮会被清空。超过 24 小时未更新的
-日志以及归档/删除会话的日志会在每日清理中删除，另有一个 512 MiB 的全局磁盘安全阀。
+默认只保留每个会话**最新一轮**的抓包；进入下一轮时上一轮会被清空。会话归档成功后会立即
+删除对应抓包；超过 1 小时未更新的日志由每小时清理删除，另有一个 512 MiB 的全局磁盘安全阀。
 
 ## 使用
 
@@ -20,7 +20,7 @@ Harness 的 initiator 链归属到对应会话。
 - **右侧边栏**：打开右侧边栏（`Ctrl/Cmd+Shift+.`，或 guide 菜单）选择 **会话 HTTP 记录**；
   窄布局，适合边聊天边快速瞄一眼请求，不打断当前主视图。
 
-两者功能一致（展开/折叠、定位、占用空间、所有会话总大小、打开目录、导出 HAR、清空当前会话、**清空不活跃**、**清空全部**、中/EN 切换）。
+两者功能一致（展开/折叠、定位、占用空间、所有会话总大小、打开目录、导出 HAR、清空当前会话、**清空全部**、中/EN 切换）。
 
 ### 面板操作
 
@@ -35,11 +35,8 @@ Harness 的 initiator 链归属到对应会话。
 - 请求/响应超过截断阈值、或响应体为二进制（base64）时会显示标记；
 - 顶部显示本会话的请求数与**总体占用空间**（鼠标悬停可看内存估算 / 每轮内存上限、磁盘文件大小 / 单轮文件上限与保存目录）；
 - **清空全部**按钮左侧显示**所有会话抓包文件的磁盘总大小**（含 `.jsonl.idx` 索引；每 8 秒随自动刷新重取，手动刷新/清空后立即更新；悬停可看文件数、会话数、`maxTotalBytes` 全局上限与目录；关闭持久化时隐藏）；
-- 标题栏 **清空不活跃 (大小)** 按钮紧挨 **清空全部**，直接显示**不活跃会话抓包的占用**，
-  二次确认后只删除这些文件；“不活跃”指**已归档**或**已删除**的会话（覆盖所有工作区），
-  现存会话和本面板正在查看的会话不受影响；不活跃为 0 时按钮禁用（详见“记录保存在哪”）；
 - 列表行同时显示**请求体（↑）与响应体（↓）**的大小，悬停可看到两者明细；详情概览里另有“合计大小”；
-- 顶部用**加粗警示文字**说明保留策略：每个会话只保留最新一轮；单轮文件达到 `maxLogFileBytes` 后只保留最近记录，超过 `retentionMs` 未更新的文件会在每日清理中删除；
+- 顶部用**加粗警示文字**说明保留策略：每个会话只保留最新一轮；单轮文件达到 `maxLogFileBytes` 后只保留最近记录；超过 `retentionMs`（默认 1 小时）未更新的文件由每小时清理删除，归档会话的抓包在归档成功时立即删除；
 - 顶部 **打开目录** 按钮会在系统文件管理器中打开记录保存目录，并尽量**选中本会话的正文 `.jsonl`**（索引 `.jsonl.idx` 与它同目录并列，打开后一眼可见）：macOS 用 `open -R`；Windows/WSL 用 `explorer.exe /select,`；Linux 依次尝试 Nautilus/Dolphin/Nemo/Thunar 的选中参数，都不支持时只打开目录。这些入口都只能可靠选中**单个**文件（传多个时只有最后一个生效），所以不强制多选。WSL 下会自动转换为 Windows 路径并调用 `explorer.exe`；
 - **筛选** 支持按方法、URL、状态码、模型或类型过滤；
 - **导出 HAR** 会下载 HAR 1.2 文件；**清空** 会删除本会话的内存记录与磁盘文件；
@@ -247,29 +244,26 @@ rm -rf <本包目录>                                         # 如不再需要�
   不是整个目录或单条响应体的上限：请求体与响应体分别有 `maxRequestBodyBytes`（8 MiB）、
   `maxResponseBodyBytes`（4 MiB）的前缀上限，所有会话文件的总量则由 `maxTotalBytes`
   （512 MiB）控制。`.jsonl.idx` 索引体积很小，但会额外计入面板显示的磁盘大小。
-- **每日清理**：插件启动后约 1 秒扫描一次，之后默认每 24 小时扫描一次 `dataDir`，只处理文件名
-  符合会话 id 规则的 `*.jsonl`：
+- **自动清理**：插件启动后约 1 秒扫描一次，之后默认每 1 小时扫描一次 `dataDir`，只处理文件名
+  符合会话 id 规则的 `*.jsonl` 及其同名 `.jsonl.idx`：
+  - 文件最后写入时间超过 `retentionMs`（默认 1 小时）时删除；过期清理不依赖会话列表是否可读；
   - 会话既不在 live Session / `sessionPersistence` 中，或已经进入 Workspace 归档集合时删除；
-  - 文件最后写入时间超过 `retentionMs`（默认 24 小时）时删除；
+    这个“孤儿/归档”判定需要权威会话列表，读不到时安全跳过；
   - 所有会话文件总大小超过 `maxTotalBytes`（默认 512 MiB）时，按最后写入时间最旧的会话优先删除。
   父会话被归档/删除时，沿 `header.parentSession` 链派生的智能体团队/子代理日志也会一并清理。
   `README.txt`、`unattributed.jsonl` 以及任何不认识的普通文件都不会被触碰。每个正文文件都有
-  同名 `.jsonl.idx` 索引；过期/清理时会成对删除。如果拿不到权威的
-  会话列表，本轮清理会安全跳过。
-- 由于是每日扫描，“超过 24 小时未更新”的文件实际可能在最后一次写入后的 **24–48 小时**内被删除。
+  同名 `.jsonl.idx` 索引；过期/清理时会成对删除。
+- 由于是每小时扫描，“超过 1 小时未更新”的文件实际可能在最后一次写入后的 **1–2 小时**内被删除；
+  归档路径不等待定时器，会在 `workspaceRegistry.archiveSession()` 成功后立即删除该会话的
+  `.jsonl` 与 `.jsonl.idx`。插件还会每 2 秒轻量比对一次 `archivedSessionIds` 作为兜底，
+  因此即使归档没有经过被包装的方法，新归档会话的日志也会很快被清理。归档时会先让
+  该会话的内存 generation 失效，再删除文件，避免归档瞬间仍在进行的响应在稍后落盘时
+  又把日志文件创建回来。
 - **数据目录是全局的**：`dataDir` 由整个 Host 共享，不按工作区拆分，所以面板顶部的
   **全部** 统计的是**所有工作区**的会话抓包。
-- **什么算“不活跃”**：已归档或已删除的会话，覆盖所有工作区：
-  - **已归档**：出现在 `workspaceRegistry.archivedSessionIds` 中（在会话列表里被归档隐藏）；
-  - **已删除**：既不在 live Session、也不在 `sessionPersistence` 中（既没有打开、也没有会话文件）。
-  判定直接复用每日清理的 `knownSessionIds()`（现存且未归档的会话集合），所以与“自动清理可删”的
-  口径完全一致，也不会把其它工作区的现存会话误判为不活跃。本面板正在查看的会话永远保留。
-  这些文件本来要等每日清理（归档/删除/过期）才消失，**清空不活跃** 可按需提前回收；
-  删除复用同一套文件队列，正在进行捕获的会话会跳过。读不到会话列表时按钮隐藏，绝不猜删。
-  目前没有已归档/已删除会话的抓包时显示 `0 B` 是正常结果。
-- **打开目录**、**清空当前会话**、**清空不活跃**和**清空全部**始终保留；自动清理不会删除目录中的
-  `README.txt`（以及未知文件），清空不活跃也不会触碰它。
-- 归档会隐藏会话但不会删除 Session 本身；本插件的策略是在归档时一并清理对应 HTTP 抓包。
+- **打开目录**、**清空当前会话**和**清空全部**始终保留；自动清理不会删除目录中的
+  `README.txt`（以及未知文件）。
+- 归档会隐藏会话但不会删除 Session 本身；本插件的策略是在归档成功时一并清理对应 HTTP 抓包。
   若之后取消归档，会话内容仍可恢复，但已清理的 HTTP 日志不会回来。
 - 每份文件按请求发起时的“当前 Agent / Session”归属。主 Agent 与它派生的智能体团队/子代理若使用
   不同的 Session id，就会分别写入各自的 `<sessionId>.jsonl`，不会自动合并到父会话面板。
@@ -288,9 +282,9 @@ rm -rf <本包目录>                                         # 如不再需要�
 | `persist` | `true` | 是否把完成的记录追加写入 `dataDir` 下的 JSONL。 |
 | `dataDir` | `$DSH_HOME/session-http-log` | 记录保存目录（无 `DSH_HOME` 时回退到 `~/.dsh/session-http-log`）。 |
 | `maxLogFileBytes` | `33554432`（32 MiB） | 当前轮 JSONL 的磁盘安全阀；达到上限时只重写该文件并保留最近约 1/4（最多 8 MiB）的记录。 |
-| `retentionMs` | `86400000`（24 小时） | 文件最后写入后保留的时间；每日清理时删除超期文件。 |
-| `cleanupLogs` | `true` | 开启自动清理：孤儿/归档文件、过期文件以及全局总容量淘汰。读不到权威会话列表时跳过。 |
-| `cleanupIntervalMs` | `86400000`（24 小时） | 自动清理扫描间隔；插件启动后约 1 秒还会先扫一次。 |
+| `retentionMs` | `3600000`（1 小时） | 文件最后写入后保留的时间；每小时清理时删除超期文件。 |
+| `cleanupLogs` | `true` | 开启自动清理：孤儿/归档文件、过期文件、归档即时删除以及全局总容量淘汰。读不到权威会话列表时只跳过孤儿/归档判定，仍按过期时间和总容量清理。 |
+| `cleanupIntervalMs` | `3600000`（1 小时） | 自动清理扫描间隔；插件启动后约 1 秒还会先扫一次。 |
 | `maxTotalBytes` | `536870912`（512 MiB） | 所有抓包文件的总磁盘安全阀；超出时按最后写入时间最旧优先删除。设为 `0` 可关闭该全局限制。 |
 | `captureUnattributed` | `false` | 为 `true` 时，无法归属到会话的请求也会记录到 `unattributed` 桶。 |
 | `openDirectoryCommand` | `''` | “打开目录”使用的命令；留空按平台选择：WSL 自动转换路径后用 Windows `explorer.exe`、macOS `open`、Windows `explorer.exe`、其它 Linux `xdg-open`。设置后只把数据目录作为唯一参数传入，**不会**再尝试选中会话文件。 |
@@ -334,9 +328,11 @@ Plugin Manager 中为“包名@版本 + 运行时版本”这一精确组合授�
   不会被记录。
 - 智能体团队/子代理产生的流量会按发起请求时 `agents.currentInitiator().id` 归属；当前不把子会话
   的 HTTP 记录聚合进父会话面板。
-- 自动清理依赖 Harness 的 `sessionPersistence` 与 `workspaceRegistry.archivedSessionIds`；
-  如果这些服务不可用或读取失败，插件不会猜测性地删除文件。`turn/start` 是“只保留最新一轮”
-  的唯一轮次边界，不会通过 HTTP 时间间隔猜测轮次。
+- 归档即时清理通过包装 `workspaceRegistry.archiveSession()` 实现（Harness 没有单独的归档完成事件），
+  并每 2 秒比对 `archivedSessionIds` 作为兜底；归档失败不会删除文件，插件卸载时会恢复原方法。
+  孤儿/已删除会话判定还依赖
+  `sessionPersistence` 与 `workspaceRegistry.archivedSessionIds`；读不到时不会猜测性删除。
+  `turn/start` 是“只保留最新一轮”的唯一轮次边界，不会通过 HTTP 时间间隔猜测轮次。
 - 报文按配置上限抓取前缀，超限时取消抓取副本，**不会延迟或截断调用方自己的响应流**；
   模型适配器在收到 `message_stop` 后主动 abort 请求属于正常结束，不会误标为“已截断”。
 - 观测器会串联此前已安装的 fetch 包装器（Developer tools 的 Inspector 也会包装 fetch），
@@ -352,3 +348,88 @@ node test/client-smoke.mjs
 ```
 
 两个冒烟测试均通过。真实页面中的视觉效果需要在打开会话后展开右侧边栏查看。
+
+---
+
+## English
+
+A DeepSeek Harness bundle that observes `globalThis.fetch`, attributes raw HTTP
+exchanges to the Session that initiated them, and displays them in the right
+Sidebar. It does not read or modify the existing Session log.
+
+### Install and use
+
+Install the package directory (or a published package) with the Plugins page or:
+
+```bash
+dsh plugin --profile web add <absolute-path-to-this-package>
+```
+
+After installation, refresh the Web GUI once. The panel is available both as a
+main conversation-view tab (**HTTP log**) and as a right-Sidebar tab (**Session
+HTTP log**). The two entry points share the same capture data.
+
+### Retention and cleanup
+
+- Only the latest turn of each Session is kept; `turn/start` clears the previous
+  turn for that Session.
+- Each Session is persisted as two files under
+  `$DSH_HOME/session-http-log` (or a custom `dataDir`):
+  - `<sessionId>.jsonl` — full records and raw payloads;
+  - `<sessionId>.jsonl.idx` — lightweight list metadata and byte offsets.
+- When `workspaceRegistry.archiveSession()` succeeds, the plugin immediately
+  deletes both files for that Session. This is done by wrapping the archive
+  method because Harness has no separate archive-completed event. A lightweight
+  check of `archivedSessionIds` every 2 seconds also catches archive paths that
+  bypass the wrapped method.
+- A cleanup scan runs about one second after startup and then hourly. It deletes
+  Session captures whose file `mtime` is older than `retentionMs` (default
+  **1 hour**), captures of archived/deleted Sessions when an authoritative
+  Session list is available, and oldest captures when `maxTotalBytes` is
+  exceeded. Expiry and global-cap cleanup do not require the Session list.
+- `README.txt`, `unattributed.jsonl`, and unknown files are never removed by the
+  automatic cleanup. A body file and its `.jsonl.idx` index are deleted
+  together.
+
+### Panel
+
+The panel supports live polling, filtering, request/response detail views,
+copy-as-cURL, HAR export, opening the data directory (selecting the current
+Session's `.jsonl` when the file manager supports it), clearing the current
+Session, and clearing all captures after confirmation. The header shows this
+Session's memory/disk usage and the total size of all Session captures. The UI
+can switch between Chinese and English independently of the global locale.
+
+### Configuration
+
+Set these keys in the bundle patch `config` (defaults shown):
+
+```yaml
+maxRequestsPerTurn: 200
+maxTurnBytes: 33554432
+maxRequestBodyBytes: 8388608
+maxResponseBodyBytes: 4194304
+maxLogFileBytes: 33554432
+retentionMs: 3600000
+cleanupLogs: true
+cleanupIntervalMs: 3600000
+maxTotalBytes: 536870912
+redactSensitiveHeaders: true
+persist: true
+dataDir: ''
+openDirectoryCommand: ''
+```
+
+- `persist: false` keeps records in memory only and disables file cleanup.
+- Credential headers such as `authorization`, `cookie`, and `x-api-key` are
+  redacted by default before persistence.
+- The data directory is intentionally kept on uninstall. Delete it manually if
+  the captured traffic should be removed.
+
+### Validation
+
+```bash
+node --check index.js && node --check client.js
+node test/host-smoke.mjs
+node test/client-smoke.mjs
+```

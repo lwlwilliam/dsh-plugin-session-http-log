@@ -79,9 +79,9 @@ redactSensitiveHeaders: true
 persist: true
 dataDir: ''            // 默认：$DSH_HOME/session-http-log（回退 ~/.dsh/session-http-log）
 maxLogFileBytes: 32 * 1024 * 1024   // 当前轮磁盘上限；达到后只重写本文件并保留最近尾部
-retentionMs: 24 * 60 * 60 * 1000    // 最后写入后保留多久；每日清理时删除超期文件
-cleanupLogs: true                   // 每日清理孤儿/归档、过期文件与全局总容量
-cleanupIntervalMs: 24 * 60 * 60 * 1000 // 每日扫描；启动后约 1 秒先扫一次
+retentionMs: 60 * 60 * 1000         // 最后写入后保留多久；每小时清理时删除超期文件
+cleanupLogs: true                   // 开启归档即时清理、孤儿/过期文件与全局总容量清理
+cleanupIntervalMs: 60 * 60 * 1000   // 每小时扫描；启动后约 1 秒先扫一次
 maxTotalBytes: 512 * 1024 * 1024    // 所有文件总磁盘安全阀；0 关闭
 captureUnattributed: false          // 为 true 时，无 initiator 的请求记入 "unattributed"
 openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe / xdg-open）
@@ -141,17 +141,28 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      `If-None-Match` 命中时返回 304，不重复发送/解析 summary 数组。
    - 清理必须成对处理正文与索引；索引无正文时单独回收。
    - `clear(sessionId)` 清空内存并删除/清空文件；仍保留手动“打开目录”和“清空”能力。
-   - **每日清理**（`cleanupLogs: true` 且 `persist: true`，启动后约 1 秒先扫一次，之后按
-     `cleanupIntervalMs`，默认 24 小时）：
+   - **归档即时清理**（`cleanupLogs: true` 且 `persist: true`）：Harness 的
+     `workspaceRegistry` 没有归档完成事件，因此在服务可用时用共享 Symbol 包装
+     `workspaceRegistry.archiveSession()`；只有归档 Promise 成功后才删除该会话的
+     `<sessionId>.jsonl` 与 `<sessionId>.jsonl.idx`，并再触发一轮扫描以覆盖
+     `parentSession` 链上的子代理/团队会话。归档清理必须先递增该会话内存桶的
+     `generation`（并移出 `sessions`）再排入删除任务，保证归档瞬间仍在进行的响应
+     捕获在结束后因 generation 不匹配而丢弃，不会在删除后重新创建日志。
+     归档失败（例如会话仍活跃）不得删除文件。
+     插件卸载时恢复原方法；另每 2 秒轻量比对一次 `archivedSessionIds` 作为兜底，
+     服务对象不可扩展或归档绕过包装方法时也能很快清理。
+   - **每小时清理**（`cleanupLogs: true` 且 `persist: true`，启动后约 1 秒先扫一次，之后按
+     `cleanupIntervalMs`，默认 1 小时）：
      - 只处理文件名符合会话 id 规则的 `*.jsonl` 及其成对 `.jsonl.idx`；`README.txt`、
        未知文件与 `unattributed.jsonl` 不删除。
+     - 文件 `mtime` 距当前时间达到 `retentionMs`（默认 1 小时）时删除；该项不依赖
+       会话列表，因此列表暂时不可读时也要继续清理过期文件。
      - 会话不在 live Session / `sessionPersistence`，或处于归档集合时，删除对应文件；
-       父会话清理时沿 `parentSession` 链清理子会话。
-     - 文件 `mtime` 距当前时间达到 `retentionMs` 时删除。由于每日扫描，实际过期时间可为
-       24–48 小时，README 必须说明这一点。
+       父会话清理时沿 `parentSession` 链清理子会话。该判定要求权威会话列表可读，
+       读不到时跳过，绝不猜测性删除。
      - 所有保留文件总大小超过 `maxTotalBytes`（>0 时）则按 `mtime` 最旧优先删整个会话文件。
      - 进行中捕获（`pending.size > 0`）或该文件仍在写队列时跳过删除；删除后同步失效对应内存桶。
-     - 读不到权威会话列表时整轮跳过，绝不猜测性删除。
+     - 由于每小时扫描，过期文件实际可能在最后写入后 1–2 小时内删除；README 必须说明这一点。
 
 3. **HTTP 路由**（每个都在 `ctx.effect(...)` 中注册并返回 disposer；`requestBody:'buffered'`）。
    所有响应都是 `new Response(JSON.stringify(x), { headers: { 'content-type':
@@ -175,24 +186,12 @@ openDirectoryCommand: ''            // '' = 平台默认（open / explorer.exe /
      清空所有会话内存记录并删除数据目录中所有符合会话 id 规则的 `*.jsonl` 与
      `.jsonl.idx`；保留 `README.txt` 和未知文件。
      删除期间暂停新捕获，避免清理与写入竞态。
-   - `GET /api/dsh-plugin-session-http-log/usage?sessionId=…` →
-     `{ dir, persist, maxTotalBytes, sessions, files, bytes, inactiveAvailable,
-     inactiveSessions, inactiveFiles, inactiveBytes }`：扫描 `dataDir` 统计**所有会话**
-     抓包文件的磁盘总大小；口径与每日清理/`clear-all` 一致，只统计文件名符合会话 id 规则的
+   - `GET /api/dsh-plugin-session-http-log/usage` →
+     `{ dir, persist, maxTotalBytes, sessions, files, bytes }`：扫描 `dataDir` 统计**所有会话**
+     抓包文件的磁盘总大小；口径与每小时清理/`clear-all` 一致，只统计文件名符合会话 id 规则的
      `*.jsonl` 与 `*.jsonl.idx`（`README.txt`、未知文件不计入），`sessions` = 去重后的会话数，
-     `files` = 文件数，`bytes` = 总字节。**不活跃** = **已归档**（`workspaceRegistry
-     .archivedSessionIds`）或**已删除**（既不在 live Session、也不在 `sessionPersistence`）
-     的会话，覆盖所有工作区；判定复用每日清理的 `knownSessionIds()`（现存且未归档的会话集合）。
-     面板会话（查询参数 `sessionId`，可为空）始终不计入不活跃；对应字段为
-     `inactiveSessions`/`inactiveFiles`/`inactiveBytes`。会话列表不可用（`knownSessionIds()`
-     返回 null）时 `inactiveAvailable` 为 false、三个计数为 0——客户端据此隐藏“清空不活跃”，
-     绝不能把“读不到”当成“全部已删除”。持久化关闭或目录不存在时各项为 0；扫描失败只记录一次
-     日志并返回 0，不让面板报错。
-   - `POST /api/dsh-plugin-session-http-log/clear-inactive` body 可选
-     `{ "sessionId": "…" }` → `{ ok: true, removedSessions, removedFiles, freedBytes }`：
-     删除已归档/已删除会话的抓包文件，覆盖所有工作区（`sessionId` 指向的面板会话始终保留）。
-     删除复用文件队列与“进行中捕获”保护；会话列表不可用时返回 503 `{ error }`，不执行任何
-     删除。并发调用合并为一次执行。
+     `files` = 文件数，`bytes` = 总字节。持久化关闭或目录不存在时各项为 0；扫描失败只记录一次
+     日志并返回 0，不让面板报错。不再提供“清空不活跃”路由或其统计字段。
    - `POST /api/dsh-plugin-session-http-log/reveal` body 可选 `{ "sessionId": "…" }` →
      `{ ok: true, dir, selected: string[] }`：在系统文件管理器中打开持久化目录（平台默认或
      `openDirectoryCommand`），并在平台支持时**选中该会话的日志文件**。`selected` 为实际请求
@@ -267,20 +266,18 @@ window.__ModuleLoader__.load({
   `api/dsh-plugin-session-http-log/clear-all`；打开目录按钮 POST
   `api/dsh-plugin-session-http-log/reveal` 并带 `{ sessionId }`（尽量选中本会话的日志文件）；
   导出按钮下载 HAR（Blob + 临时 `<a download>`）；
-  另以约 8 秒间隔轮询 `GET api/dsh-plugin-session-http-log/usage?sessionId=…` 展示所有会话抓包
-  文件的总大小与其中不活跃会话的占用（面板不可见时停止；失败时静默保留上一次值；手动刷新、
-  清空当前会话、清空全部、清空不活跃后立即重取）。
+  另以约 8 秒间隔轮询 `GET api/dsh-plugin-session-http-log/usage` 展示所有会话抓包文件的
+  总大小（面板不可见时停止；失败时静默保留上一次值；手动刷新、清空当前会话、清空全部后
+  立即重取）。
 - 布局：紧凑头部（标题、记录数、占用空间、自动刷新、刷新、清空当前会话、导出、打开目录）；
   “清空全部”放在标题栏右侧语言切换旁，其左侧显示**所有会话抓包文件的磁盘总大小**
   （悬停提示文件数、会话数、`maxTotalBytes` 全局上限与目录；持久化关闭时隐藏），
   二次确认后调用 clear-all；
-  **清空不活跃**按钮紧挨着“清空全部”放在标题栏右侧（同一 ghost 样式），标签中直接显示
-  不活跃会话的占用大小（`header.clearInactive`，如“清空不活跃 (2.1 MB)”），悬停提示
-  文件数/会话数与“现存会话不会被清理”；不活跃为 0 或口径不可用时禁用/隐藏，二次确认后
-  调用 clear-inactive（当前查看的会话始终保留）；标题行允许换行，窄边栏下操作组整体换到下一行；
-  持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary` 的警示文字展示保留策略：
-  只保留最新一轮、单轮 `maxLogFileBytes` 上限、`retentionMs` 过期清理；文案必须说明
-  打开目录、清空当前会话与清空全部功能仍然可用，不得把自动清理描述成只影响一个会话。
+  不再提供“清空不活跃”按钮或对应路由；归档清理完全自动化。标题行允许换行，窄边栏下
+  操作组整体换到下一行；持久化开启时，头部必须用加粗、`--dsw-alias-state-warn-primary`
+  的警示文字展示保留策略：只保留最新一轮、单轮 `maxLogFileBytes` 上限、`retentionMs`
+  过期后的每小时清理，以及归档成功后的即时清理；文案必须说明打开目录、清空当前会话与
+  清空全部功能仍然可用，不得把自动清理描述成只影响一个会话。
   筛选输入（按 method/url/status/model 子串）；列表行；详情区。面板可能很窄——不要固定宽度，
   用 `min-width: 0`、换行/省略。空、加载中、错误状态都要有。
 - 行：方法 chip、路径（tooltip 为完整 URL）、按状态着色的状态 chip（2xx success、3xx idle、
@@ -307,8 +304,7 @@ window.__ModuleLoader__.load({
    `turn/start` 后上一轮内存和文件被清空且新轮继续写、摘要索引冷读与 `part` 懒加载详情、
    ETag/304、过期文件清理、`maxTotalBytes` 全局淘汰、`clear-all` 删除全部会话文件但保留
    `README.txt`、`usage` 汇总所有会话文件（关闭持久化时全 0，`clear-all` 后归零且不统计未知文件）、
-   `usage` 的不活跃统计只包含已归档/已删除会话（全局）并排除面板会话、
-   `clear-inactive` 只删这些文件并保留现存/面板会话、
+   `workspaceRegistry.archiveSession()` 成功后 `.jsonl` 与 `.jsonl.idx` 立即成对删除且其它会话保留、
    WSL reveal 把 Windows 路径传给 `explorer.exe` 并在带 `sessionId` 时用 `/select,` 选中正文、
    macOS 的 `open -R` 只接收正文 `.jsonl`、`selected` 只包含真实存在的主文件、
    未知/已归档会话的 JSONL 被清理且有效文件保留；dispose 后

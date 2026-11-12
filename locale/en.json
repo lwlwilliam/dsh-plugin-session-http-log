@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session HTTP log",
-    "description": "Records the raw HTTP requests and responses a session makes and shows them in the right Sidebar. Only the latest turn is kept; expired or archived captures are removed by the daily cleanup. Uninstalling the plugin does not delete the captured data directory."
+    "description": "Records the raw HTTP requests and responses a session makes and shows them in the right Sidebar. Only the latest turn is kept; captures for a session are deleted immediately after archiving, and captures not updated for 1 hour are removed by the hourly cleanup. Uninstalling the plugin does not delete the captured data directory."
   }
 }

@@ -5,7 +5,7 @@
  * （LLM API 调用、网页搜索/抓取、MCP HTTP 等），把每次交换归属到
  * 发起它的会话，按会话保留一份有上限的内存日志，并按配置
  * 以 JSONL 追加到 `$DSH_HOME/session-http-log`（目录名保持稳定，不随
- * 插件改名迁移，以免已有抓包数据在面板中消失），同时提供八个
+ * 插件改名迁移，以免已有抓包数据在面板中消失），同时提供七个
  * 经过身份校验的 `/api/dsh-plugin-session-http-log/*` 路由供客户端面板读取。
  *
  * 本模块必须保持自包含：从已安装的 bundle 位置只能解析 Node 内置模块，
@@ -16,8 +16,7 @@
  *   GET  /api/dsh-plugin-session-http-log/record?sessionId&id      → 单条完整记录
  *   POST /api/dsh-plugin-session-http-log/clear                    → { ok, removed }
  *   POST /api/dsh-plugin-session-http-log/clear-all                → { ok, removedSessions, removedRecords, removedFiles }
- *   GET  /api/dsh-plugin-session-http-log/usage                    → 所有会话抓包文件总大小（含不活跃会话占用）
- *   POST /api/dsh-plugin-session-http-log/clear-inactive           → { ok, removedSessions, removedFiles, freedBytes }
+ *   GET  /api/dsh-plugin-session-http-log/usage                    → 所有会话抓包文件总大小
  *   GET  /api/dsh-plugin-session-http-log/har?sessionId            → HAR 1.2 归档
  *   POST /api/dsh-plugin-session-http-log/reveal                   → { ok, dir, selected }（打开数据目录并尽量选中会话日志）
  *
@@ -39,10 +38,10 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 const DEFAULT_MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024
 const DEFAULT_MAX_TURN_BYTES = 32 * 1024 * 1024
 const DEFAULT_MAX_LOG_FILE_BYTES = 32 * 1024 * 1024
-/** 自动清理：最后写入后保留 24 小时，之后在清理扫描中删除。 */
-const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000
-/** 自动清理扫描间隔：每天一轮；插件启动后另有一次立即扫描。 */
-const DEFAULT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
+/** 自动清理：最后写入后保留 1 小时，之后在清理扫描中删除。 */
+const DEFAULT_RETENTION_MS = 60 * 60 * 1000
+/** 自动清理扫描间隔：每小时一轮；插件启动后另有一次立即扫描。 */
+const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
 /** 所有会话抓包文件的总磁盘安全阀；0 表示不启用。 */
 const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 
@@ -53,7 +52,6 @@ const ROUTE_PATHS = Object.freeze({
   clear: '/api/dsh-plugin-session-http-log/clear',
   clearAll: '/api/dsh-plugin-session-http-log/clear-all',
   usage: '/api/dsh-plugin-session-http-log/usage',
-  clearInactive: '/api/dsh-plugin-session-http-log/clear-inactive',
   har: '/api/dsh-plugin-session-http-log/har',
   reveal: '/api/dsh-plugin-session-http-log/reveal',
 })
@@ -81,6 +79,11 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/
 
 /** 没有会话发起者时的归属桶（仅在配置开启时使用）。 */
 const UNATTRIBUTED_SESSION = 'unattributed'
+
+/** WorkspaceRegistry 上的共享归档清理钩子，避免重复包装 archiveSession。 */
+const ARCHIVE_CLEANUP_HOOK = Symbol.for('@local/dsh-plugin-session-http-log.archive-cleanup')
+/** 归档集合兜底轮询间隔；只读一个数组，用于捕获非 archiveSession 路径。 */
+const ARCHIVE_WATCH_INTERVAL_MS = 2000
 
 /** 捕获记录中用于替换凭据头部的占位值。 */
 const REDACTED_VALUE = '[redacted]'
@@ -126,10 +129,10 @@ const DATA_DIR_MARKER_CONTENT = [
   '- 不再需要这些记录时，可以整体删除本目录，不会影响其他功能。',
   '- 每个会话只保留最新一轮对话产生的 HTTP 记录；下一轮开始时上一轮记录会被清空。',
   `- 单轮文件达到 maxLogFileBytes（默认 ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB）后只保留最近一小段记录并重新写入。`,
-  `- 超过 ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} 小时未更新的日志，以及已归档/已删除会话的日志，会在每日清理中删除。`,
+  `- 超过 ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} 小时未更新的日志会在每小时清理中删除；归档会话的日志会在归档时立即删除。`,
   `- 所有会话文件另有 maxTotalBytes 总磁盘安全阀（默认 ${DEFAULT_MAX_TOTAL_BYTES / (1024 * 1024)} MiB）。`,
   '- 凭据类请求头（authorization、cookie、api-key 等）默认已脱敏为 [redacted]。',
-  '- 清理某个会话只会删除对应的 jsonl 文件，本说明文件会保留。',
+  '- 清理某个会话会成对删除对应的 .jsonl 与 .jsonl.idx 文件，本说明文件会保留。',
   '- 目录名沿用 session-http-log：插件改名不会迁移本目录，以免已有数据丢失。',
   '',
   'This directory holds the raw HTTP capture files of the',
@@ -141,8 +144,10 @@ const DATA_DIR_MARKER_CONTENT = [
   'Only the latest turn of each session is retained; a new turn clears the previous one.',
   `Each turn file is reset when it reaches maxLogFileBytes (default ${DEFAULT_MAX_LOG_FILE_BYTES / (1024 * 1024)} MiB),`,
   'keeping only its most recent records.',
-  `Files not updated for ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} hours, and files for archived/deleted sessions,`,
-  'are removed by the daily cleanup. A global maxTotalBytes safety cap also applies.',
+  `Files not updated for ${DEFAULT_RETENTION_MS / (60 * 60 * 1000)} hour(s) are removed by the hourly cleanup;`,
+  'captures for archived sessions are removed immediately when the archive succeeds.',
+  'A global maxTotalBytes safety cap also applies.',
+  'Clearing a session removes its .jsonl payload and .jsonl.idx index together; this README stays.',
   'Credential headers are redacted by default.',
   'The directory name stays "session-http-log" so a plugin rename never',
   'orphans existing captures.',
@@ -178,7 +183,7 @@ const requestsByBody = new WeakMap()
 export const inject = ['connection']
 
 /**
- * 安装 fetch 观察器以及八个经过身份校验的路由；持久化开启时还会在数据目录
+ * 安装 fetch 观察器以及七个经过身份校验的路由；持久化开启时还会在数据目录
  * 内放置一份清理提示说明文件。
  * @param {import('@deepseek-ai/cordis').Context} ctx - 宿主插件上下文。
  * @param {object} [config] - patch 行配置，按防御式读取。
@@ -211,7 +216,7 @@ export function apply(ctx, config = {}) {
   }, 'dsh-plugin-session-http-log: latest-turn retention')
   // 说明文件是尽力而为的副产物：不 await，失败只记日志，绝不影响激活。
   runtime.writeDirectoryMarker()
-  // 自动清理在启动后约 1 秒先扫一轮，之后每天扫一轮：
+  // 自动清理在启动后约 1 秒先扫一轮，之后每小时扫一轮：
   // 删除归档/删除会话的孤儿文件，以及超过保留时间未更新的文件。
   ctx.effect(() => {
     if (runtime.cleanupLogs !== true) return () => {}
@@ -225,7 +230,26 @@ export function apply(ctx, config = {}) {
       if (initialTimer !== null) clearTimeout(initialTimer)
       clearInterval(interval)
     }
-  }, 'dsh-plugin-session-http-log: daily log cleanup')
+  }, 'dsh-plugin-session-http-log: hourly log cleanup')
+  // Harness 的 WorkspaceRegistry 没有“已归档”事件；包装 archiveSession，
+  // 在归档成功后立即删除该会话的正文与索引，避免等待下一轮定时扫描。
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['workspaceRegistry'], (scope) => {
+      const registry = typeof scope?.get === 'function'
+        ? scope.get('workspaceRegistry')
+        : undefined
+      scope.effect(
+        () => runtime.installArchiveCleanup(registry),
+        'dsh-plugin-session-http-log: archive cleanup',
+      )
+      // 兜底：即使 archiveSession 包装失效（例如服务被替换或不可扩展），
+      // 也能在约 2 秒内发现新归档会话并删除对应日志。
+      scope.effect(
+        () => runtime.watchArchivedSessions(registry),
+        'dsh-plugin-session-http-log: archive cleanup watcher',
+      )
+    })
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -426,8 +450,6 @@ function createRuntime(ctx, config) {
   let clearingAll = false
   /** 合并并发的“清空全部”请求，保证删除过程只有一个执行者。 */
   let clearingAllPromise = null
-  /** 合并并发的“清空不活跃”请求，避免两轮删除重叠。 */
-  let clearingInactivePromise = null
   /** 防止定时器和手动触发产生重叠的日志清理扫描。 */
   let sweepingLogs = false
 
@@ -1193,6 +1215,206 @@ function createRuntime(ctx, config) {
     return clearingAllPromise
   }
 
+  /* -------------------------------------------------------- 归档即时清理    */
+
+  /**
+   * 归档成功后立即删除该会话的正文与索引，并再触发一轮扫描以覆盖
+   * 沿 parentSession 链派生的子代理/团队会话。归档已经持久化，因此
+   * 这里可以明确按会话 id 删除，不依赖会话列表是否仍可读。
+   * @param {string} sessionId - 已归档的会话 id。
+   * @returns {Promise<void>}
+   */
+  async function cleanArchivedSession(sessionId) {
+    if (config.persist !== true || config.cleanupLogs !== true) return
+    if (typeof sessionId !== 'string' || !SESSION_ID_PATTERN.test(sessionId)) return
+    try {
+      await removeArchivedSessionFiles(sessionId)
+      // 子代理会话自身可能仍在 live 列表中，但父会话归档后也应一并清理。
+      void sweepLogs()
+    } catch (error) {
+      reportOnce('archive-cleanup', error)
+    }
+  }
+
+  /**
+   * 归档清理专用的文件删除。归档已经成功，因此先让该会话的内存桶失效
+   * 再删除文件：即使归档时还有响应体在捕获，结束时也会因 generation
+   * 不匹配而丢弃迟到的持久化写入，不会在删除后重新创建文件。
+   * @param {string} sessionId - 已归档会话 id。
+   * @returns {Promise<boolean>} 是否完成了删除流程。
+   */
+  async function removeArchivedSessionFiles(sessionId) {
+    if (clearingAll) return false
+    const file = sessionFile(sessionId)
+    const activeEntry = sessions.get(sessionId)
+    if (activeEntry !== undefined) {
+      activeEntry.generation += 1
+      sessions.delete(sessionId)
+    }
+    await enqueueFileTask(file, async () => {
+      for (const target of [file, sessionIndexFile(sessionId)]) {
+        try {
+          await unlink(target)
+        } catch (error) {
+          if (error?.code !== 'ENOENT') reportOnce(`archive-unlink:${target}`, error)
+        }
+      }
+    }, 'archive-delete')
+    return true
+  }
+
+  /**
+   * 定时比对 WorkspaceRegistry 的归档集合，处理无法通过 archiveSession
+   * 包装捕获的归档变化；启动时也会立即处理现有归档集合中的历史日志。
+   * 只读取一个内存数组，成本远低于完整扫描。
+   * @param {object|undefined} registry - WorkspaceRegistry；缺省时从 ctx 读取。
+   * @returns {() => void}
+   */
+  function watchArchivedSessions(registry) {
+    if (config.persist !== true || config.cleanupLogs !== true) return () => {}
+    let resolved = registry
+    if (resolved === undefined) {
+      try {
+        resolved = ctx.get('workspaceRegistry')
+      } catch {
+        return () => {}
+      }
+    }
+    if (resolved === null || typeof resolved !== 'object') return () => {}
+    /** 已经归档但还未确认删除成功的会话；捕获仍在进行时会留到下一轮重试。 */
+    const pending = new Set()
+    /** 上一轮看到的归档集合，用于识别“新归档”和取消已解除归档的待删项。 */
+    let observed = new Set()
+    let running = false
+    const check = async () => {
+      if (running) return
+      running = true
+      try {
+        let ids
+        try {
+          ids = resolved.archivedSessionIds
+        } catch {
+          return
+        }
+        if (!Array.isArray(ids)) return
+        const current = new Set()
+        let discovered = false
+        for (const id of ids) {
+          if (typeof id !== 'string' || !SESSION_ID_PATTERN.test(id)) continue
+          current.add(id)
+          if (!observed.has(id)) {
+            pending.add(id)
+            discovered = true
+          }
+        }
+        observed = current
+        // 若在删除重试期间又取消归档，则停止继续删除该会话。
+        for (const id of [...pending]) {
+          if (!current.has(id)) pending.delete(id)
+        }
+        let removedAny = false
+        for (const id of [...pending]) {
+          try {
+            if (await removeArchivedSessionFiles(id)) {
+              pending.delete(id)
+              removedAny = true
+            }
+          } catch (error) {
+            reportOnce('archive-watch-cleanup', error)
+          }
+        }
+        // 子代理/团队会话沿 parentSession 链清理，交给完整扫描即可。
+        if (discovered || removedAny) void sweepLogs()
+      } finally {
+        running = false
+      }
+    }
+    void check()
+    const timer = setInterval(() => { void check() }, ARCHIVE_WATCH_INTERVAL_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearInterval(timer)
+  }
+
+  /**
+   * 在 WorkspaceRegistry 上安装归档清理观察器。Harness 暴露了
+   * `archiveSession()` 但没有归档完成事件；用共享 Symbol 共享一层包装，
+   * 只在归档 Promise 成功后通知监听者，归档失败（例如会话仍活跃）不删文件。
+   * 若服务对象不可扩展则放弃包装，定时比对与小时级扫描仍会兜底。
+   * @param {object|undefined} registry - WorkspaceRegistry；缺省时从 ctx 读取。
+   * @returns {() => void}
+   */
+  function installArchiveCleanup(registry) {
+    let resolved = registry
+    if (resolved === undefined) {
+      try {
+        resolved = ctx.get('workspaceRegistry')
+      } catch {
+        return () => {}
+      }
+    }
+    registry = resolved
+    if (registry === null || typeof registry !== 'object' || typeof registry.archiveSession !== 'function') {
+      return () => {}
+    }
+    let hook = registry[ARCHIVE_CLEANUP_HOOK]
+    if (hook === undefined) {
+      const original = registry.archiveSession
+      const listeners = new Set()
+      const wrapped = function (...args) {
+        const result = original.apply(this, args)
+        const sessionId = args[0]
+        const notify = () => {
+          for (const listener of [...listeners]) {
+            try {
+              listener(sessionId)
+            } catch (error) {
+              reportOnce('archive-cleanup-listener', error)
+            }
+          }
+        }
+        if (result !== null && typeof result?.then === 'function') result.then(notify, () => {})
+        else notify()
+        return result
+      }
+      try {
+        Object.defineProperty(registry, ARCHIVE_CLEANUP_HOOK, {
+          value: { original, wrapped, listeners },
+          configurable: true,
+        })
+        registry.archiveSession = wrapped
+      } catch (error) {
+        reportOnce('archive-cleanup-hook', error)
+        try {
+          delete registry[ARCHIVE_CLEANUP_HOOK]
+        } catch {
+          /* 删除失败也不影响既有扫描兜底 */
+        }
+        return () => {}
+      }
+      hook = registry[ARCHIVE_CLEANUP_HOOK]
+    }
+    const listener = (sessionId) => {
+      void cleanArchivedSession(sessionId)
+    }
+    hook.listeners.add(listener)
+    return () => {
+      hook.listeners.delete(listener)
+      if (hook.listeners.size > 0) return
+      if (registry.archiveSession === hook.wrapped) {
+        try {
+          registry.archiveSession = hook.original
+        } catch {
+          /* 卸载期间恢复失败时不影响宿主 */
+        }
+      }
+      try {
+        delete registry[ARCHIVE_CLEANUP_HOOK]
+      } catch {
+        /* Symbol 属性是共享标记，删除失败只影响后续重复包装 */
+      }
+    }
+  }
+
   /* -------------------------------------------------------------- 孤儿清理    */
 
   /**
@@ -1320,10 +1542,11 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * 每日清理：删除已归档/已删除会话的孤儿文件、超过 retentionMs 未更新
+   * 每小时清理：删除已归档/已删除会话的孤儿文件、超过 retentionMs 未更新
    * 的文件，并在所有会话总大小超过 maxTotalBytes 时按最旧文件优先淘汰。
    * 只处理文件名严格符合会话 id 规则的 JSONL；README、未知文件和
-   * `unattributed` 桶都保留。只有拿到权威会话列表时才执行清理。
+   * `unattributed` 桶都保留。过期与容量清理不依赖会话列表；只有判定
+   * 已归档/已删除时要求权威会话列表可用，读不到时绝不猜删这部分。
    * @returns {Promise<void>}
    */
   async function sweepLogs() {
@@ -1331,7 +1554,6 @@ function createRuntime(ctx, config) {
     sweepingLogs = true
     try {
       const known = await knownSessionIds()
-      if (known === null) return
       let entries
       try {
         entries = await readdir(config.dataDir, { withFileTypes: true })
@@ -1388,7 +1610,7 @@ function createRuntime(ctx, config) {
           totalBytes += size
           continue
         }
-        const orphan = !known.has(sessionId)
+        const orphan = known !== null && !known.has(sessionId)
         const expired = now - mtimeMs >= config.retentionMs
         if (orphan || expired) {
           const removed = await removeLogFile(sessionId, file)
@@ -1838,7 +2060,7 @@ function createRuntime(ctx, config) {
 
   /**
    * 扫描数据目录中的会话抓包文件。
-   * 口径与每日清理、`clear-all` 一致：只认文件名符合会话 id 规则的
+   * 口径与每小时清理、`clear-all` 一致：只认文件名符合会话 id 规则的
    * `*.jsonl` 与 `*.jsonl.idx`；README 与未知文件不计入。持久化关闭时返回
    * 空数组，目录不存在或扫描失败也不会让路由失败。
    * @returns {Promise<Array<{sessionId: string, bytes: number}>>}
@@ -1873,48 +2095,13 @@ function createRuntime(ctx, config) {
   }
 
   /**
-   * 汇总“不活跃”抓包：会话已归档，或已删除（不在 live Session 与
-   * sessionPersistence 中）。这与每日清理判定“可删除”的口径一致，覆盖
-   * **所有工作区**；面板正在查看的会话（`excludeSessionId`）始终保留。
-   * `knownSessionIds()` 不可用时返回 `inactiveAvailable: false`，客户端据此
-   * 隐藏“清空不活跃”入口，绝不能猜删。
-   * @param {Array<{sessionId: string, bytes: number}>} files - 扫描结果。
-   * @param {Set<string>|null} knownSessionIds - 现存（未归档）会话 id 集合。
-   * @param {string} excludeSessionId - 始终保留的会话 id（可为空）。
-   * @returns {{inactiveAvailable: boolean, inactiveSessions: number, inactiveFiles: number, inactiveBytes: number}}
-   */
-  function summarizeInactive(files, knownSessionIds, excludeSessionId) {
-    if (knownSessionIds === null) {
-      return { inactiveAvailable: false, inactiveSessions: 0, inactiveFiles: 0, inactiveBytes: 0 }
-    }
-    const bySession = new Map()
-    for (const file of files) {
-      if (knownSessionIds.has(file.sessionId) || file.sessionId === excludeSessionId) continue
-      const bucket = bySession.get(file.sessionId) ?? { files: 0, bytes: 0 }
-      bucket.files += 1
-      bucket.bytes += file.bytes
-      bySession.set(file.sessionId, bucket)
-    }
-    let inactiveFiles = 0
-    let inactiveBytes = 0
-    for (const bucket of bySession.values()) {
-      inactiveFiles += bucket.files
-      inactiveBytes += bucket.bytes
-    }
-    return { inactiveAvailable: true, inactiveSessions: bySession.size, inactiveFiles, inactiveBytes }
-  }
-
-  /**
-   * `GET /usage` → 所有会话抓包文件的磁盘总大小，以及其中不活跃会话的占用。
+   * `GET /usage` → 所有会话抓包文件的磁盘总大小。
    * 直接扫描数据目录，因此也覆盖没有打开面板、但文件仍在磁盘上的会话。
-   * 查询参数 `sessionId`（可选）表示面板正在查看的会话，永不归入不活跃。
    * @param {Request} request - 路由请求。
    * @returns {Promise<Response>}
    */
   async function handleUsageRequest(request) {
-    const url = new URL(request.url)
-    const requested = url.searchParams.get('sessionId') ?? ''
-    const excludeSessionId = SESSION_ID_PATTERN.test(requested) ? requested : ''
+    void request
     const files = await scanCaptureFiles()
     const sessionIds = new Set()
     let bytes = 0
@@ -1929,66 +2116,7 @@ function createRuntime(ctx, config) {
       sessions: sessionIds.size,
       files: files.length,
       bytes,
-      ...summarizeInactive(files, await knownSessionIds(), excludeSessionId),
     })
-  }
-
-  /**
-   * 清空不活跃会话的抓包文件：删除已归档或已删除（不在 live Session 与
-   * sessionPersistence 中）的会话文件，覆盖所有工作区。复用 `removeLogFile`
-   * 的文件队列与“进行中捕获”保护；会话列表不可用时不执行任何删除。
-   * @param {string} excludeSessionId - 始终保留的会话 id（可为空）。
-   * @returns {Promise<{removedSessions: number, removedFiles: number, freedBytes: number}|null>}
-   */
-  function clearInactiveSessions(excludeSessionId) {
-    if (clearingInactivePromise !== null) return clearingInactivePromise
-    clearingInactivePromise = (async () => {
-      const files = await scanCaptureFiles()
-      const known = await knownSessionIds()
-      if (known === null) return null
-      const bySession = new Map()
-      for (const file of files) {
-        if (known.has(file.sessionId) || file.sessionId === excludeSessionId) continue
-        const bucket = bySession.get(file.sessionId) ?? { files: 0, bytes: 0 }
-        bucket.files += 1
-        bucket.bytes += file.bytes
-        bySession.set(file.sessionId, bucket)
-      }
-      let removedSessions = 0
-      let removedFiles = 0
-      let freedBytes = 0
-      for (const [sessionId, bucket] of bySession) {
-        const removed = await removeLogFile(sessionId, sessionFile(sessionId))
-        if (!removed) continue
-        removedSessions += 1
-        removedFiles += bucket.files
-        freedBytes += bucket.bytes
-      }
-      return { removedSessions, removedFiles, freedBytes }
-    })().finally(() => {
-      clearingInactivePromise = null
-    })
-    return clearingInactivePromise
-  }
-
-  /**
-   * `POST /clear-inactive` → 清空不活跃会话的抓包文件。
-   * body 可选 `{ "sessionId": "…" }`：面板正在查看的会话始终保留。
-   * @param {Request} request - 路由请求。
-   * @returns {Promise<Response>}
-   */
-  async function handleClearInactiveRequest(request) {
-    let payload = null
-    try {
-      payload = await request.json()
-    } catch {
-      payload = null
-    }
-    const requested = payload !== null && typeof payload === 'object' ? payload.sessionId : undefined
-    const excludeSessionId = typeof requested === 'string' && SESSION_ID_PATTERN.test(requested) ? requested : ''
-    const result = await clearInactiveSessions(excludeSessionId)
-    if (result === null) return errorResponse(503, 'session list is unavailable')
-    return jsonResponse({ ok: true, ...result })
   }
 
   /**
@@ -2390,7 +2518,6 @@ function createRuntime(ctx, config) {
     { path: ROUTE_PATHS.clear, methods: ['POST'], handler: handleClearRequest },
     { path: ROUTE_PATHS.clearAll, methods: ['POST'], handler: handleClearAllRequest },
     { path: ROUTE_PATHS.usage, methods: ['GET', 'HEAD'], handler: handleUsageRequest },
-    { path: ROUTE_PATHS.clearInactive, methods: ['POST'], handler: handleClearInactiveRequest },
     { path: ROUTE_PATHS.har, methods: ['GET', 'HEAD'], handler: handleHarRequest },
     { path: ROUTE_PATHS.reveal, methods: ['POST'], handler: handleRevealRequest },
   ]
@@ -2402,6 +2529,8 @@ function createRuntime(ctx, config) {
     writeDirectoryMarker,
     handleSessionEvent,
     sweepLogs,
+    installArchiveCleanup,
+    watchArchivedSessions,
     reportError: reportOnce,
     cleanupLogs: config.cleanupLogs && config.persist,
     cleanupIntervalMs: config.cleanupIntervalMs,

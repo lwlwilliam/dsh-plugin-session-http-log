@@ -115,13 +115,8 @@ window.__ModuleLoader__.load({
       'header.allSessions': 'All {size}',
       'header.allSessionsTooltip': 'All session captures on disk across workspaces (incl. .jsonl.idx): {size}\n{files} files / {sessions} sessions\nGlobal cap: {limit}\nDirectory: {dir}',
       'header.noLimit': 'no cap',
-      'header.clearInactive': 'Clear inactive ({size})',
-      'header.clearInactiveTitle': 'Delete HTTP captures of archived or deleted sessions: {files} files / {sessions} sessions. The current session and other existing sessions are kept.',
-      'header.clearInactiveConfirm': 'Delete archived/deleted session captures ({size}: {sessions} sessions / {files} files)? This cannot be undone; existing sessions are kept.',
-      'header.clearInactiveConfirmYes': 'Delete inactive captures',
-      'header.clearingInactive': 'Clearing inactive…',
-      'header.retention': 'Only the latest turn is kept. Turn file cap: {limit}; captures not updated for {hours}h are cleaned up automatically.',
-      'header.retentionTitle': 'A new turn clears the previous turn for this session. The turn file is capped, and idle files expire on the daily cleanup. Other sessions are handled independently; the Open folder and Clear actions remain available.',
+      'header.retention': 'Only the latest turn is kept. Turn file cap: {limit}; captures not updated for {hours}h are removed by the hourly cleanup, and archived-session captures are removed when archiving succeeds.',
+      'header.retentionTitle': 'A new turn clears the previous turn for this session. The turn file is capped; files idle for the retention window are removed by the hourly cleanup, and captures for a session are deleted as soon as it is archived. Other sessions are handled independently; the Open folder and Clear actions remain available.',
       'header.spaceUninstallNote': 'Uninstalling the plugin does not delete this directory.',
       'header.notPersisted': 'not persisted',
       'header.openFolder': 'Open folder',
@@ -132,7 +127,6 @@ window.__ModuleLoader__.load({
       'error.export': 'HAR export failed: {message}',
       'error.clear': 'Clear failed: {message}',
       'error.clearAll': 'Could not clear all captures: {message}',
-      'error.clearInactive': 'Could not clear inactive captures: {message}',
     }
     const zh = {
       'tab.title': '会话 HTTP 记录',
@@ -217,13 +211,8 @@ window.__ModuleLoader__.load({
       'header.allSessions': '全部 {size}',
       'header.allSessionsTooltip': '所有工作区的会话抓包文件（含 .jsonl.idx 索引）：{size}\n{files} 个文件 / {sessions} 个会话\n全局上限：{limit}\n目录：{dir}',
       'header.noLimit': '不限',
-      'header.clearInactive': '清空不活跃 ({size})',
-      'header.clearInactiveTitle': '删除已归档或已删除会话的 HTTP 抓包：{files} 个文件 / {sessions} 个会话。本面板会话与其它现存会话不会被清理。',
-      'header.clearInactiveConfirm': '删除已归档/已删除会话的抓包文件（{size}：{sessions} 个会话 / {files} 个文件）？此操作不可恢复；现存会话不受影响。',
-      'header.clearInactiveConfirmYes': '清空不活跃记录',
-      'header.clearingInactive': '正在清空不活跃…',
-      'header.retention': '仅保留最新一轮：单轮文件上限 {limit}；超过 {hours} 小时未更新会自动清理。',
-      'header.retentionTitle': '同一会话进入新一轮时会清空上一轮记录；单轮文件达到上限时只保留最近记录。每日清理会删除过期及已归档/已删除会话的文件；其它会话独立处理。打开目录与清空功能始终保留。',
+      'header.retention': '仅保留最新一轮：单轮文件上限 {limit}；超过 {hours} 小时未更新会在每小时清理中删除，会话归档成功后抓包会立即删除。',
+      'header.retentionTitle': '同一会话进入新一轮时会清空上一轮记录；单轮文件达到上限时只保留最近记录。超过保留时长未更新的文件由每小时清理删除，会话归档成功后其抓包会立即删除；其它会话独立处理。打开目录与清空功能始终保留。',
       'header.spaceUninstallNote': '卸载插件不会删除该目录。',
       'header.notPersisted': '未持久化',
       'header.openFolder': '打开目录',
@@ -234,7 +223,6 @@ window.__ModuleLoader__.load({
       'error.export': '导出 HAR 失败：{message}',
       'error.clear': '清空失败：{message}',
       'error.clearAll': '清空全部抓包失败：{message}',
-      'error.clearInactive': '清空不活跃抓包失败：{message}',
     }
 
     // ---------------------------------------------------------------------
@@ -620,15 +608,12 @@ window.__ModuleLoader__.load({
           : 0,
         retentionMs: typeof payload.retentionMs === 'number' && isFinite(payload.retentionMs) && payload.retentionMs > 0
           ? payload.retentionMs
-          : 24 * 60 * 60 * 1000,
+          : 60 * 60 * 1000,
       }
     }
 
-    async function fetchUsage(sessionId, signal) {
-      const query = new URLSearchParams()
-      if (typeof sessionId === 'string' && sessionId !== '') query.set('sessionId', sessionId)
-      const suffix = query.toString() === '' ? '' : '?' + query.toString()
-      const response = await fetch(ROUTE + '/usage' + suffix, {
+    async function fetchUsage(signal) {
+      const response = await fetch(ROUTE + '/usage', {
         method: 'GET',
         credentials: 'same-origin',
         headers: { accept: 'application/json' },
@@ -643,16 +628,6 @@ window.__ModuleLoader__.load({
         persist: payload.persist === true,
         maxTotalBytes: typeof payload.maxTotalBytes === 'number' && isFinite(payload.maxTotalBytes) && payload.maxTotalBytes > 0
           ? payload.maxTotalBytes
-          : 0,
-        inactiveAvailable: payload.inactiveAvailable === true,
-        inactiveBytes: typeof payload.inactiveBytes === 'number' && isFinite(payload.inactiveBytes) && payload.inactiveBytes > 0
-          ? payload.inactiveBytes
-          : 0,
-        inactiveFiles: typeof payload.inactiveFiles === 'number' && isFinite(payload.inactiveFiles) && payload.inactiveFiles > 0
-          ? payload.inactiveFiles
-          : 0,
-        inactiveSessions: typeof payload.inactiveSessions === 'number' && isFinite(payload.inactiveSessions) && payload.inactiveSessions > 0
-          ? payload.inactiveSessions
           : 0,
       }
     }
@@ -698,17 +673,6 @@ window.__ModuleLoader__.load({
         method: 'POST',
         credentials: 'same-origin',
         headers: { accept: 'application/json' },
-        signal,
-      })
-      return readJsonResponse(response)
-    }
-
-    async function postClearInactive(sessionId, signal) {
-      const response = await fetch(ROUTE + '/clear-inactive', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
         signal,
       })
       return readJsonResponse(response)
@@ -1111,7 +1075,7 @@ window.__ModuleLoader__.load({
       const [dir, setDir] = React.useState('')
       const [persist, setPersist] = React.useState(false)
       const [maxLogFileBytes, setMaxLogFileBytes] = React.useState(0)
-      const [retentionMs, setRetentionMs] = React.useState(24 * 60 * 60 * 1000)
+      const [retentionMs, setRetentionMs] = React.useState(60 * 60 * 1000)
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState(null)
       const [nonce, setNonce] = React.useState(0)
@@ -1210,17 +1174,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 所有会话抓包文件的磁盘总大小，以及其中不活跃会话的占用。独立于列表
-     * 轮询：扫描目录比拉列表贵，所以自动刷新时放慢到 8 秒一次；手动刷新、
-     * 清空、清空全部、清空不活跃后立即重取。面板不可见时不轮询；失败时
-     * 静默保留上次结果（这只是展示数字）。
-     * @param {string} sessionId - 面板正在查看的会话（永不归入不活跃）。
+     * 所有会话抓包文件的磁盘总大小。独立于列表轮询：扫描目录比拉列表贵，
+     * 所以自动刷新时放慢到 8 秒一次；手动刷新、清空、清空全部后立即重取。
+     * 面板不可见时不轮询；失败时静默保留上次结果（这只是展示数字）。
      * @param {boolean} active - 面板是否可见。
      * @param {boolean} autoRefresh - 是否随面板自动刷新。
      * @param {number} refreshKey - 递增该值可立即重取。
-     * @returns {{bytes: number, files: number, sessions: number, dir: string, persist: boolean, maxTotalBytes: number, inactiveAvailable: boolean, inactiveBytes: number, inactiveFiles: number, inactiveSessions: number, loaded: boolean}}
+     * @returns {{bytes: number, files: number, sessions: number, dir: string, persist: boolean, maxTotalBytes: number, loaded: boolean}}
      */
-    function useUsage(sessionId, active, autoRefresh, refreshKey) {
+    function useUsage(active, autoRefresh, refreshKey) {
       const [usage, setUsage] = React.useState({
         bytes: 0,
         files: 0,
@@ -1228,10 +1190,6 @@ window.__ModuleLoader__.load({
         dir: '',
         persist: false,
         maxTotalBytes: 0,
-        inactiveAvailable: false,
-        inactiveBytes: 0,
-        inactiveFiles: 0,
-        inactiveSessions: 0,
         loaded: false,
       })
 
@@ -1256,7 +1214,7 @@ window.__ModuleLoader__.load({
           if (busy || cancelled || isHidden()) return
           busy = true
           try {
-            const snapshot = await fetchUsage(sessionId, controller.signal)
+            const snapshot = await fetchUsage(controller.signal)
             if (!cancelled) setUsage({ ...snapshot, loaded: true })
           } catch (caught) {
             // 总大小仅用于展示：失败时保留上一次结果，错误由列表区域统一提示。
@@ -1286,7 +1244,7 @@ window.__ModuleLoader__.load({
           }
           controller.abort()
         }
-      }, [sessionId, active, autoRefresh, refreshKey])
+      }, [active, autoRefresh, refreshKey])
 
       return usage
     }
@@ -1413,10 +1371,8 @@ window.__ModuleLoader__.load({
       const [selectedId, setSelectedId] = React.useState(null)
       const [confirmClear, setConfirmClear] = React.useState(false)
       const [confirmClearAll, setConfirmClearAll] = React.useState(false)
-      const [confirmClearInactive, setConfirmClearInactive] = React.useState(false)
       const [clearing, setClearing] = React.useState(false)
       const [clearingAll, setClearingAll] = React.useState(false)
-      const [clearingInactive, setClearingInactive] = React.useState(false)
       const [exporting, setExporting] = React.useState(false)
       const [revealing, setRevealing] = React.useState(false)
       const [revealFeedback, setRevealFeedback] = React.useState('idle')
@@ -1447,7 +1403,7 @@ window.__ModuleLoader__.load({
 
       const feed = useFeed(sessionId, autoRefresh, active)
       const [usageNonce, setUsageNonce] = React.useState(0)
-      const usage = useUsage(sessionId, active, autoRefresh, usageNonce)
+      const usage = useUsage(active, autoRefresh, usageNonce)
 
       const selectedSummary = React.useMemo(
         () => feed.records.find((record) => record.id === selectedId) || null,
@@ -1522,16 +1478,6 @@ window.__ModuleLoader__.load({
         })
         : undefined
 
-      // “清空不活跃”：删除已归档或已删除会话的抓包（所有工作区）。
-      const showInactiveClear = usage.loaded && usage.persist && usage.inactiveAvailable
-      const inactiveSizeText = formatBytes(usage.inactiveBytes)
-      const clearInactiveTitle = showInactiveClear
-        ? t('header.clearInactiveTitle', {
-          files: String(usage.inactiveFiles),
-          sessions: String(usage.inactiveSessions),
-        })
-        : undefined
-
       const langSwitchLabel = props.lang === 'zh' ? t('lang.switchToEnglish') : t('lang.switchToChinese')
       const otherLangLabel = props.lang === 'zh' ? t('lang.enShort') : t('lang.zhShort')
 
@@ -1592,21 +1538,6 @@ window.__ModuleLoader__.load({
           setActionError(t('error.clearAll', { message: errorMessage(caught) }))
         } finally {
           setClearingAll(false)
-        }
-      }
-
-      const handleClearInactive = async () => {
-        setClearingInactive(true)
-        setActionError(null)
-        try {
-          await postClearInactive(sessionId)
-          setConfirmClearInactive(false)
-          feed.refresh()
-          setUsageNonce((value) => value + 1)
-        } catch (caught) {
-          setActionError(t('error.clearInactive', { message: errorMessage(caught) }))
-        } finally {
-          setClearingInactive(false)
         }
       }
 
@@ -1703,27 +1634,11 @@ window.__ModuleLoader__.load({
                   title: allSessionsTooltip,
                 }, t('header.allSessions', { size: formatBytes(usage.bytes) }))
                 : null,
-              showInactiveClear
-                ? h('button', {
-                  type: 'button',
-                  className: 'shl-btn shl-btn-ghost shl-global-clear',
-                  onClick: () => {
-                    setConfirmClear(false)
-                    setConfirmClearAll(false)
-                    setConfirmClearInactive((value) => !value)
-                  },
-                  'aria-expanded': confirmClearInactive,
-                  title: clearInactiveTitle,
-                  'aria-label': t('header.clearInactive', { size: inactiveSizeText }),
-                  disabled: usage.inactiveBytes === 0 || clearingInactive,
-                }, t('header.clearInactive', { size: inactiveSizeText }))
-                : null,
               h('button', {
                 type: 'button',
                 className: 'shl-btn shl-btn-ghost shl-global-clear',
                 onClick: () => {
                   setConfirmClear(false)
-                  setConfirmClearInactive(false)
                   setConfirmClearAll((value) => !value)
                 },
                 'aria-expanded': confirmClearAll,
@@ -1752,7 +1667,6 @@ window.__ModuleLoader__.load({
               className: 'shl-btn',
               onClick: () => {
                 setConfirmClearAll(false)
-                setConfirmClearInactive(false)
                 setConfirmClear((value) => !value)
               },
               'aria-expanded': confirmClear,
@@ -1791,18 +1705,6 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClearAll, disabled: clearingAll },
                 clearingAll ? t('header.clearingAll') : t('header.clearAllConfirmYes')),
               h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClearAll(false), disabled: clearingAll },
-                t('header.cancel')))
-            : null,
-          confirmClearInactive
-            ? h('div', { className: 'shl-banner' },
-              h('span', { className: 'shl-banner-text' }, t('header.clearInactiveConfirm', {
-                size: inactiveSizeText,
-                sessions: String(usage.inactiveSessions),
-                files: String(usage.inactiveFiles),
-              })),
-              h('button', { type: 'button', className: 'shl-btn shl-btn-danger', onClick: handleClearInactive, disabled: clearingInactive },
-                clearingInactive ? t('header.clearingInactive') : t('header.clearInactiveConfirmYes')),
-              h('button', { type: 'button', className: 'shl-btn', onClick: () => setConfirmClearInactive(false), disabled: clearingInactive },
                 t('header.cancel')))
             : null,
           actionError != null

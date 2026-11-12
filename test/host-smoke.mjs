@@ -25,7 +25,14 @@ const sessionEventListeners = new Set()
 const warnings = []
 let knownSessionIds = new Set(['session-test', 'session-evict', 'session-marker'])
 let sessionParents = new Map()
-const workspaceRegistry = { archivedSessionIds: [] }
+const workspaceRegistry = {
+  archivedSessionIds: [],
+  async archiveSession(sessionId) {
+    if (!this.archivedSessionIds.includes(sessionId)) {
+      this.archivedSessionIds = [...this.archivedSessionIds, sessionId]
+    }
+  },
+}
 /** Sessions the fake Host currently considers live. */
 const liveSessions = []
 
@@ -149,6 +156,12 @@ const server = createServer(async (req, res) => {
     setTimeout(() => res.end('true}'), 80)
     return
   }
+  if (req.url.startsWith('/very-slow')) {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.write('{"verySlow":')
+    setTimeout(() => res.end('true}'), 1200)
+    return
+  }
   res.writeHead(404).end()
 })
 server.listen(0, '127.0.0.1')
@@ -158,7 +171,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 // ── install the plugin under test ───────────────────────────────────────────
 apply(fakeCtx, config)
 assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed')
-assert.equal(routes.size, 8, `expected 8 routes, got ${[...routes.keys()].join(', ')}`)
+assert.equal(routes.size, 7, `expected 7 routes, got ${[...routes.keys()].join(', ')}`)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const route = (path) => {
@@ -231,7 +244,7 @@ assert.equal(feed.dir, dataDir, 'data directory reported')
 assert.equal(feed.persist, false, 'persistence flag reported')
 assert.equal(feed.maxLogFileBytes, 32 * 1024 * 1024, 'per-turn disk cap reported')
 assert.equal(feed.latestTurnOnly, true, 'latest-turn retention reported')
-assert.equal(feed.retentionMs, 24 * 60 * 60 * 1000, 'retention window reported')
+assert.equal(feed.retentionMs, 60 * 60 * 1000, 'hourly retention window reported')
 assert.equal(typeof feed.maxTotalBytes, 'number', 'global disk cap reported')
 
 // 1a. aggregate disk usage across sessions; nothing on disk when persistence is off.
@@ -241,8 +254,7 @@ assert.equal(usageOff.json.persist, false, 'usage reports persistence flag')
 assert.equal(usageOff.json.bytes, 0, 'no aggregate usage when persistence is off')
 assert.equal(usageOff.json.files, 0, 'no capture files counted when persistence is off')
 assert.equal(usageOff.json.dir, dataDir, 'usage reports the data directory')
-assert.equal(usageOff.json.inactiveAvailable, true, 'inactive usage is measurable when the session list is available')
-assert.equal(usageOff.json.inactiveBytes, 0, 'no inactive usage when persistence is off')
+assert.equal('inactiveAvailable' in usageOff.json, false, 'inactive usage fields are no longer exposed')
 const feedEtag = feedResponse.headers.get('etag')
 assert.ok(typeof feedEtag === 'string' && feedEtag.length > 0, 'records response has an ETag')
 const notModified = await callRoute('/api/dsh-plugin-session-http-log/records', {
@@ -580,9 +592,6 @@ assert.equal(usageBefore.maxTotalBytes, 512 * 1024 * 1024, 'folder usage reports
 assert.ok(usageBefore.bytes > 0, 'folder usage sums every session capture file')
 assert.ok(usageBefore.files >= 2, `folder usage counts capture files (got ${usageBefore.files})`)
 assert.ok(usageBefore.sessions >= 2, `folder usage counts sessions (got ${usageBefore.sessions})`)
-assert.equal(usageBefore.inactiveAvailable, true, 'inactive usage available')
-assert.equal(usageBefore.inactiveSessions, 0, 'known sessions are not inactive')
-assert.equal(usageBefore.inactiveBytes, 0, 'no inactive bytes while every session still exists')
 const [clearedAll, clearedAllAgain] = await Promise.all([
   callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
   callRoute('/api/dsh-plugin-session-http-log/clear-all', { method: 'POST' }),
@@ -615,24 +624,33 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after marker run')
 assert.equal(routes.size, 0, 'routes removed after marker run')
 await rm(markerDir, { recursive: true, force: true })
 
-// 9b-2. clear-inactive deletes only archived or deleted session captures
-// (globally, across workspaces) and always keeps the viewed session.
-const inactiveDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-inactive-'))
-knownSessionIds.add('session-view')
-knownSessionIds.add('session-archived-log')
-workspaceRegistry.archivedSessionIds = ['session-archived-log']
+// 9b-2. archiving a session immediately deletes its JSONL body and index,
+// while captures belonging to other sessions remain on disk.
+const archiveDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-archive-'))
+knownSessionIds.add('session-archive-view')
+knownSessionIds.add('session-archive-log')
+knownSessionIds.add('session-watch-log')
+knownSessionIds.add('session-pending-archive')
+workspaceRegistry.archivedSessionIds = []
 liveSessions.length = 0
 apply(fakeCtx, {
   ...config,
   persist: true,
-  dataDir: inactiveDir,
-  cleanupLogs: false,
+  dataDir: archiveDir,
+  retentionMs: 60 * 60 * 1000,
+  cleanupLogs: true,
+  cleanupIntervalMs: 60 * 60 * 1000,
 })
-assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for inactive run')
+assert.notEqual(globalThis.fetch, originalFetch, 'fetch wrapper installed for archive run')
+assert.equal(
+  routes.has('/api/dsh-plugin-session-http-log/clear-inactive'),
+  false,
+  'clear-inactive route was removed',
+)
 for (const [sessionId, body] of [
-  ['session-view', '{"inactive":"view"}'],
-  ['session-archived-log', '{"inactive":"archived"}'],
-  ['session-gone-log', '{"inactive":"gone"}'],
+  ['session-archive-view', '{"archive":"view"}'],
+  ['session-archive-log', '{"archive":"archived"}'],
+  ['session-watch-log', '{"archive":"watched"}'],
 ]) {
   initiator = { id: sessionId }
   await (await globalThis.fetch(`${base}/json`, {
@@ -643,56 +661,77 @@ for (const [sessionId, body] of [
 }
 await waitFor(async () => {
   try {
-    for (const id of ['session-view', 'session-archived-log', 'session-gone-log']) {
-      await access(join(inactiveDir, `${id}.jsonl`))
-    }
+    await access(join(archiveDir, 'session-archive-view.jsonl'))
+    await access(join(archiveDir, 'session-archive-view.jsonl.idx'))
+    await access(join(archiveDir, 'session-archive-log.jsonl'))
+    await access(join(archiveDir, 'session-archive-log.jsonl.idx'))
+    await access(join(archiveDir, 'session-watch-log.jsonl'))
+    await access(join(archiveDir, 'session-watch-log.jsonl.idx'))
     return true
   } catch {
     return false
   }
-}, 'inactive fixture files')
-
-const usageInactive = (await callRoute('/api/dsh-plugin-session-http-log/usage', {
-  query: '?sessionId=session-view',
-})).json
-assert.equal(usageInactive.inactiveAvailable, true, 'inactive usage available')
-assert.equal(usageInactive.inactiveSessions, 2, 'archived and deleted sessions are inactive')
-assert.ok(usageInactive.inactiveBytes > 0, 'inactive usage counts archived/deleted session files')
-assert.ok(usageInactive.inactiveBytes < usageInactive.bytes, 'inactive usage stays below the total')
-
-const clearedInactive = (await callRoute('/api/dsh-plugin-session-http-log/clear-inactive', {
-  method: 'POST',
-  body: { sessionId: 'session-view' },
-})).json
-assert.equal(clearedInactive.ok, true, 'clear-inactive reports success')
-assert.equal(clearedInactive.removedSessions, 2, 'clear-inactive removes archived and deleted sessions')
-assert.ok(clearedInactive.removedFiles >= 2, 'clear-inactive counts removed files')
-assert.ok(clearedInactive.freedBytes > 0, 'clear-inactive reports freed bytes')
-await access(join(inactiveDir, 'session-view.jsonl'))
-await access(join(inactiveDir, 'session-view.jsonl.idx'))
-for (const removed of ['session-archived-log', 'session-gone-log']) {
-  try {
-    await access(join(inactiveDir, `${removed}.jsonl`))
-    assert.fail(`${removed} capture file should be deleted by clear-inactive`)
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error
+}, 'archive fixture files')
+await workspaceRegistry.archiveSession('session-archive-log')
+assert.ok(workspaceRegistry.archivedSessionIds.includes('session-archive-log'), 'session archive recorded')
+await waitFor(async () => {
+  for (const suffix of ['.jsonl', '.jsonl.idx']) {
+    try {
+      await access(join(archiveDir, `session-archive-log${suffix}`))
+      return false
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
   }
-}
-const usageAfterInactive = (await callRoute('/api/dsh-plugin-session-http-log/usage', {
-  query: '?sessionId=session-view',
-})).json
-assert.equal(usageAfterInactive.inactiveSessions, 0, 'no inactive sessions remain')
-assert.equal(usageAfterInactive.inactiveBytes, 0, 'no inactive bytes remain')
-assert.ok(usageAfterInactive.bytes > 0, 'the viewed session capture stays on disk')
-assert.ok(usageAfterInactive.files < usageInactive.files, 'usage file count drops after clear-inactive')
-assert.ok(usageAfterInactive.files >= 2, 'the viewed session capture and index remain counted')
+  return true
+}, 'archived session capture and index removal')
+// Simulate an archive path that bypasses the wrapped method: the watcher must
+// still discover the new archived id and remove both files.
+workspaceRegistry.archivedSessionIds = [...workspaceRegistry.archivedSessionIds, 'session-watch-log']
+await waitFor(async () => {
+  for (const suffix of ['.jsonl', '.jsonl.idx']) {
+    try {
+      await access(join(archiveDir, `session-watch-log${suffix}`))
+      return false
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+  return true
+}, 'archive watcher fallback removal', 5000)
+
+// Archive while a response body is still being captured: the first cleanup
+// attempt must not lose the retry, otherwise the late persistence recreates
+// the files after the archive promise resolves.
+initiator = { id: 'session-pending-archive' }
+const pendingArchiveResponse = await globalThis.fetch(`${base}/very-slow`)
+await workspaceRegistry.archiveSession('session-pending-archive')
+await pendingArchiveResponse.text()
+await waitFor(async () => {
+  for (const suffix of ['.jsonl', '.jsonl.idx']) {
+    try {
+      await access(join(archiveDir, `session-pending-archive${suffix}`))
+      return false
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+  }
+  return true
+}, 'archive cleanup retry after late persistence', 7000)
+
+await access(join(archiveDir, 'session-archive-view.jsonl'))
+await access(join(archiveDir, 'session-archive-view.jsonl.idx'))
+const usageAfterArchive = (await callRoute('/api/dsh-plugin-session-http-log/usage')).json
+assert.ok(usageAfterArchive.bytes > 0, 'the non-archived session capture remains counted')
+assert.equal(usageAfterArchive.sessions, 1, 'only the non-archived session remains')
+assert.equal('inactiveAvailable' in usageAfterArchive, false, 'usage omits removed inactive fields')
 
 for (const cleanup of cleanups.splice(0)) cleanup()
-assert.equal(globalThis.fetch, originalFetch, 'fetch restored after inactive run')
-assert.equal(routes.size, 0, 'routes removed after inactive run')
+assert.equal(globalThis.fetch, originalFetch, 'fetch restored after archive run')
+assert.equal(routes.size, 0, 'routes removed after archive run')
 workspaceRegistry.archivedSessionIds = []
 liveSessions.length = 0
-await rm(inactiveDir, { recursive: true, force: true })
+await rm(archiveDir, { recursive: true, force: true })
 
 // 9c. cold list reads the lightweight index; detail is loaded lazily by offset.
 const lazyDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-lazy-'))
@@ -917,7 +956,7 @@ assert.equal(globalThis.fetch, originalFetch, 'fetch restored after turn run')
 assert.equal(routes.size, 0, 'routes removed after turn run')
 await rm(turnDir, { recursive: true, force: true })
 
-// 12. daily cleanup removes expired files, keeps fresh files, and enforces the global cap.
+// 12. hourly cleanup removes expired files, keeps fresh files, and enforces the global cap.
 const ttlDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-ttl-'))
 knownSessionIds = new Set(['session-fresh', 'session-expired', 'session-newer', 'session-older'])
 workspaceRegistry.archivedSessionIds = []
@@ -1032,4 +1071,4 @@ await rm(orphanDir, { recursive: true, force: true })
 server.close()
 await once(server, 'close')
 await rm(dataDir, { recursive: true, force: true })
-console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, latest-turn, lazy-index, ETag, TTL, quota, clear-all, rotation, orphan cleanup, dispose)')
+console.log('PASS dsh-plugin-session-http-log host smoke test (capture, routes, redaction, HAR, totals, reveal, clear, eviction, latest-turn, lazy-index, ETag, TTL, quota, clear-all, rotation, archive cleanup, orphan cleanup, dispose)')

@@ -7,9 +7,9 @@
         maxRequestBodyBytes: 8388608
         maxResponseBodyBytes: 4194304
         maxLogFileBytes: 33554432
-        retentionMs: 86400000
+        retentionMs: 3600000
         cleanupLogs: true
-        cleanupIntervalMs: 86400000
+        cleanupIntervalMs: 3600000
         maxTotalBytes: 536870912
         redactSensitiveHeaders: true
         persist: true
