@@ -867,6 +867,30 @@ function createRuntime(ctx, config) {
   }
 
   /**
+   * 磁盘轮转后把内存口径同步收窄到“文件里还剩什么”。
+   * 只保留仍在文件中的记录，以及仍在捕获中的记录（后者尚未落盘，不能丢），
+   * 其余记录从 `records`/`summaries` 中释放并扣掉估算字节。不同步的话，
+   * `bytes` 会继续贴着每轮上限，而磁盘与列表已被轮转削小，面板上就会出现
+   * “占用比全部还大”。
+   * @param {ReturnType<typeof sessionEntry>} entry - 会话桶。
+   * @param {object[]} kept - 轮转后仍留在文件中的记录。
+   */
+  function retainRotatedRecords(entry, kept) {
+    const keptSet = new Set(kept)
+    const retained = []
+    for (const record of entry.records) {
+      const pending = record?.completedAt === null || record?.completedAt === undefined
+      if (pending || keptSet.has(record)) {
+        retained.push(record)
+        continue
+      }
+      releaseRecordBytes(entry, record)
+    }
+    entry.records = retained
+    entry.summaries = retained.slice()
+  }
+
+  /**
    * 重新计算捕获体增长后的记录大小，然后重新检查
    * 字节预算。对已从内存淘汰的记录会被忽略。
    * @param {ReturnType<typeof sessionEntry>|null|undefined} entry - 会话桶。
@@ -1038,9 +1062,10 @@ function createRuntime(ctx, config) {
         await writeFile(file, tail.text, 'utf8')
         await writeFile(indexFile, tail.indexText, 'utf8')
         entry.logBytes = tail.bytes
-        entry.summaries = tail.records.slice()
         entry.revision += 1
         for (const persisted of tail.records) persistedRecords.add(persisted)
+        // 内存计数必须和刚重写出来的文件对齐，否则“占用”会长期高于磁盘。
+        retainRotatedRecords(entry, tail.records)
         return
       }
       const bodyOffset = entry.logBytes

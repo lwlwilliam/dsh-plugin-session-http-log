@@ -14,7 +14,8 @@ window.__ModuleLoader__.load({
     const ROUTE = 'api/dsh-plugin-session-http-log'
     /** 面板挂载且自动刷新开启时的列表刷新间隔。 */
     const POLL_INTERVAL_MS = 1200
-    /** “所有会话总大小”独立轮询间隔：目录扫描比列表轮询贵，放慢一些。 */
+    /** “所有会话总大小”的扫描限频：目录扫描比列表轮询贵，放慢到 8 秒一次；
+     *  但它始终挂在列表轮询的同一拍上取，两个数字才不会错位。 */
     const USAGE_POLL_INTERVAL_MS = 8000
     /** 服务端列表上限；面板不会请求更多。 */
     const LIST_LIMIT = 500
@@ -1079,19 +1080,30 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState(true)
       const [error, setError] = React.useState(null)
       const [nonce, setNonce] = React.useState(0)
+      const [usage, setUsage] = React.useState({
+        bytes: 0,
+        files: 0,
+        sessions: 0,
+        dir: '',
+        persist: false,
+        maxTotalBytes: 0,
+        loaded: false,
+      })
       const etagRef = React.useRef('')
+      /** 上次取磁盘总量的时刻；用来把目录扫描限频到 USAGE_POLL_INTERVAL_MS。 */
+      const usageAtRef = React.useRef(0)
 
       React.useEffect(() => {
         etagRef.current = ''
-        if (sessionId === '') {
-          setLoading(false)
-          return undefined
-        }
+        usageAtRef.current = 0
         if (active !== true) {
           setLoading(false)
           return undefined
         }
-        setLoading(true)
+        // 没有选中会话时也要取磁盘总量，但不再轮询会话记录。
+        const recordsEnabled = sessionId !== ''
+        if (recordsEnabled) setLoading(true)
+        else setLoading(false)
         const controller = new AbortController()
         let cancelled = false
         let busy = false
@@ -1110,12 +1122,32 @@ window.__ModuleLoader__.load({
           if (autoRefresh && timer == null && !isHidden()) timer = window.setInterval(tick, POLL_INTERVAL_MS)
         }
 
+        /**
+         * 一拍采样：会话记录与磁盘总量在这里一起取，两个数字才可比。
+         * 目录扫描比列表贵，所以限频到 USAGE_POLL_INTERVAL_MS；刷新/清空后
+         * 该时刻会归零，下一次 tick 立即重取。
+         */
         const tick = async () => {
           if (busy || cancelled || isHidden()) return
           busy = true
+          const wantUsage = Date.now() - usageAtRef.current >= USAGE_POLL_INTERVAL_MS
+          if (wantUsage) usageAtRef.current = Date.now()
           try {
-            const snapshot = await fetchRecords(sessionId, controller.signal, etagRef.current)
-            if (cancelled || snapshot === null) return
+            const [recordsResult, usageResult] = await Promise.allSettled([
+              recordsEnabled
+                ? fetchRecords(sessionId, controller.signal, etagRef.current)
+                : Promise.resolve(null),
+              wantUsage ? fetchUsage(controller.signal) : Promise.resolve(null),
+            ])
+            if (cancelled) return
+            // 磁盘总量仅用于展示：失败或中止都保留上一次结果，不影响列表错误提示。
+            if (usageResult.status === 'fulfilled' && usageResult.value !== null) {
+              setUsage({ ...usageResult.value, loaded: true })
+            }
+            if (!recordsEnabled) return
+            if (recordsResult.status === 'rejected') throw recordsResult.reason
+            const snapshot = recordsResult.value
+            if (snapshot === null) return
             etagRef.current = snapshot.etag
             setRecords(snapshot.records)
             setTotal(snapshot.total)
@@ -1131,7 +1163,7 @@ window.__ModuleLoader__.load({
             setError(errorMessage(caught))
           } finally {
             busy = false
-            if (!cancelled) setLoading(false)
+            if (!cancelled && recordsEnabled) setLoading(false)
           }
         }
 
@@ -1169,84 +1201,9 @@ window.__ModuleLoader__.load({
         retentionMs,
         loading,
         error,
+        usage,
         refresh: () => setNonce((value) => value + 1),
       }
-    }
-
-    /**
-     * 所有会话抓包文件的磁盘总大小。独立于列表轮询：扫描目录比拉列表贵，
-     * 所以自动刷新时放慢到 8 秒一次；手动刷新、清空、清空全部后立即重取。
-     * 面板不可见时不轮询；失败时静默保留上次结果（这只是展示数字）。
-     * @param {boolean} active - 面板是否可见。
-     * @param {boolean} autoRefresh - 是否随面板自动刷新。
-     * @param {number} refreshKey - 递增该值可立即重取。
-     * @returns {{bytes: number, files: number, sessions: number, dir: string, persist: boolean, maxTotalBytes: number, loaded: boolean}}
-     */
-    function useUsage(active, autoRefresh, refreshKey) {
-      const [usage, setUsage] = React.useState({
-        bytes: 0,
-        files: 0,
-        sessions: 0,
-        dir: '',
-        persist: false,
-        maxTotalBytes: 0,
-        loaded: false,
-      })
-
-      React.useEffect(() => {
-        if (active !== true) return undefined
-        const controller = new AbortController()
-        let cancelled = false
-        let busy = false
-        let timer = null
-        const isHidden = () =>
-          typeof document !== 'undefined' && document.visibilityState === 'hidden'
-        const stopTimer = () => {
-          if (timer != null) {
-            window.clearInterval(timer)
-            timer = null
-          }
-        }
-        const startTimer = () => {
-          if (autoRefresh && timer == null && !isHidden()) timer = window.setInterval(tick, USAGE_POLL_INTERVAL_MS)
-        }
-        const tick = async () => {
-          if (busy || cancelled || isHidden()) return
-          busy = true
-          try {
-            const snapshot = await fetchUsage(controller.signal)
-            if (!cancelled) setUsage({ ...snapshot, loaded: true })
-          } catch (caught) {
-            // 总大小仅用于展示：失败时保留上一次结果，错误由列表区域统一提示。
-            if (cancelled || isAbortError(caught)) return
-          } finally {
-            busy = false
-          }
-        }
-        const onVisibilityChange = () => {
-          if (isHidden()) {
-            stopTimer()
-          } else {
-            void tick()
-            startTimer()
-          }
-        }
-        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-          document.addEventListener('visibilitychange', onVisibilityChange)
-        }
-        void tick()
-        startTimer()
-        return () => {
-          cancelled = true
-          stopTimer()
-          if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
-            document.removeEventListener('visibilitychange', onVisibilityChange)
-          }
-          controller.abort()
-        }
-      }, [active, autoRefresh, refreshKey])
-
-      return usage
     }
 
     function useDetail(sessionId, recordId, pollWhilePending) {
@@ -1402,8 +1359,8 @@ window.__ModuleLoader__.load({
       }, [])
 
       const feed = useFeed(sessionId, autoRefresh, active)
-      const [usageNonce, setUsageNonce] = React.useState(0)
-      const usage = useUsage(active, autoRefresh, usageNonce)
+      // 磁盘总量与列表来自同一拍采样，两个数字才可比。
+      const usage = feed.usage
 
       const selectedSummary = React.useMemo(
         () => feed.records.find((record) => record.id === selectedId) || null,
@@ -1502,9 +1459,8 @@ window.__ModuleLoader__.load({
 
       const handleRefresh = () => {
         setActionError(null)
+        // refresh 会重取会话记录，并在同一拍重新扫描磁盘总量。
         feed.refresh()
-        // 刷新时一并重取所有会话的总大小。
-        setUsageNonce((value) => value + 1)
         // 详情是独立请求；手动刷新不应让它保持陈旧。
         if (selectedId != null) detail.retry()
       }
@@ -1517,7 +1473,6 @@ window.__ModuleLoader__.load({
           setConfirmClear(false)
           setSelectedId(null)
           feed.refresh()
-          setUsageNonce((value) => value + 1)
         } catch (caught) {
           setActionError(t('error.clear', { message: errorMessage(caught) }))
         } finally {
@@ -1533,7 +1488,6 @@ window.__ModuleLoader__.load({
           setConfirmClearAll(false)
           setSelectedId(null)
           feed.refresh()
-          setUsageNonce((value) => value + 1)
         } catch (caught) {
           setActionError(t('error.clearAll', { message: errorMessage(caught) }))
         } finally {

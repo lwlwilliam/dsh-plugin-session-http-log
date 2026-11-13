@@ -150,6 +150,12 @@ const server = createServer(async (req, res) => {
     res.end(Buffer.from([0, 1, 2, 255, 254]))
     return
   }
+  // 大报文样本：用来验证磁盘轮转后内存计数是否跟着收窄。
+  if (req.url.startsWith('/blob')) {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({ blob: 'b'.repeat(120 * 1024) }))
+    return
+  }
   if (req.url.startsWith('/slow')) {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.write('{"slow":')
@@ -887,10 +893,30 @@ assert.ok(retainedLines.length >= 2, `rotation keeps a recent tail (kept ${retai
 assert.ok(retainedLines.some((line) => JSON.stringify(line).includes('trim-10')), 'rotation keeps a pre-rotation record')
 const retainedIds = retainedLines.map((line) => line.id)
 assert.deepEqual(retainedIds.slice().sort((a, b) => a - b), retainedIds, 'retained log ids stay ordered')
-for (const cleanup of cleanups.splice(0)) cleanup()
+
+// 10b. 轮转必须同时收窄内存计数：否则面板上的“占用”会贴着每轮上限，而磁盘
+// 已经被轮转削小，看上去像“占用比全部还大”。一条大报文就到单轮文件上限，
+// 因此轮转后内存里只应剩下刚重写进去的那一两条记录。
+const ROTATED_MEMORY_LIMIT = 400 * 1024
+for (let index = 0; index < 6; index += 1) {
+  await (await globalThis.fetch(`${base}/blob`)).text()
+}
+const syncedFeed = await waitFor(async () => {
+  const feed = (await callRoute('/api/dsh-plugin-session-http-log/records', {
+    query: '?sessionId=session-trim',
+  })).json
+  const settled = feed.records.every((record) => record.completedMs != null)
+  return settled && feed.totalBytes < ROTATED_MEMORY_LIMIT ? feed : null
+}, 'rotation to trim in-memory accounting')
+assert.ok(
+  syncedFeed.totalBytes < ROTATED_MEMORY_LIMIT,
+  `rotated session keeps only the retained tail in memory (got ${syncedFeed.totalBytes})`,
+)
+// 等待排队中的落盘结束，避免 rm 与追加写竞争。
+await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()))
 assert.equal(globalThis.fetch, originalFetch, 'fetch restored after trim run')
 assert.equal(routes.size, 0, 'routes removed after trim run')
-await rm(trimDir, { recursive: true, force: true })
+await rm(trimDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
 
 // 11. latest-turn retention clears the previous turn on turn/start.
 const turnDir = await mkdtemp(join(tmpdir(), 'dsh-plugin-session-http-log-turn-'))
